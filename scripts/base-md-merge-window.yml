@@ -1,0 +1,25 @@
+# The weekly window in which a pull request that changes the fleet guidance
+# (agents-md/base.md or agents-md/sections/**) may be merged by automation
+# (ADR 0039), and in which no eval run starts (skills-evals ADR 0017's
+# eval-pause addendum: a run that starts mid-window could read guidance that
+# is half merged). Read by scripts/base-md-merge-window.js, and fetched by
+# skills-evals' scripts/guidance_merge_window.py. This is the one place the
+# bounds are written; change them here and nowhere else.
+#
+# Every key is required and nothing else is allowed.
+#
+#   timezone  IANA zone the times below are wall-clock times in. A zone
+#             with daylight saving time moves the window's UTC instants
+#             with the clocks: in a zone that is five hours behind UTC in
+#             winter, 12:00 is 17:00 UTC, and 16:00 UTC in summer.
+#   weekday   ISO weekday of the window: 1 is Monday, 7 is Sunday.
+#   start     first minute inside the window, "HH:MM".
+#   end       first minute after the window, "HH:MM", later than start.
+#
+# Your window: Monday noon to 2 PM in your own time zone. bootstrap/copy-starter.sh
+# writes the timezone line below from TIME_ZONE in your fleet.env when it copies
+# this file; the weekday and the hours are yours to change here.
+timezone: America/New_York
+weekday: 1
+start: "12:00"
+end: "14:00"

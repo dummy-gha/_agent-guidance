@@ -1,0 +1,960 @@
+"""Tests for scripts/agent_check_lane.py and the runner features it relies on.
+
+Every repo is a temp directory with a temp HOME and no global or system git
+config. The candidate runners are temp copies of the template with one arm
+with check_lessons and lesson_checks replaced, the way the lesson-check lane
+adds a lesson.
+
+GITHUB_EVENT_NAME, GITHUB_EVENT_PATH and GITHUB_ACTIONS are dropped from every
+environment here: under GitHub Actions they describe the real pull request,
+and the runner's pr-tldr check would read that pull request's description.
+
+Run: python3 -m unittest discover -s test -p 'test_agent_check_lane.py'
+(test/run-tests.sh's agent_checks group runs it that way).
+"""
+
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+LANE = REPO_ROOT / "scripts" / "agent_check_lane.py"
+RUNNER = REPO_ROOT / "templates" / "agent-checks" / "agent-checks"
+CASES = REPO_ROOT / "test" / "fixtures" / "agent-checks-cases.jsonl"
+LESSONS_HEAD = "check_lessons() {\n"
+LESSONS_END = "\n}\n"
+LESSON_CHECKS_LINE = 'lesson_checks="'
+
+
+def with_lesson_arm(text, arm, ids=""):
+    """The runner's text with its whole check_lessons function replaced by
+    `arm` and lesson_checks set to `ids`, whatever lessons the template has
+    by now. The function ends at the first closing brace in column 0, which
+    is how the runner writes every function."""
+    assert text.count(LESSONS_HEAD) == 1, "the template must define check_lessons exactly once"
+    start = text.index(LESSONS_HEAD)
+    end = text.index(LESSONS_END, start) + len(LESSONS_END)
+    text = text[:start] + arm + text[end:]
+    lines = text.split("\n")
+    hits = [i for i, line in enumerate(lines) if line.startswith(LESSON_CHECKS_LINE)]
+    assert len(hits) == 1, "the template must set lesson_checks exactly once"
+    lines[hits[0]] = f'{LESSON_CHECKS_LINE}{ids}"'
+    return "\n".join(lines)
+GITHUB_RUN_VARS = ("GITHUB_EVENT_NAME", "GITHUB_EVENT_PATH", "GITHUB_ACTIONS")
+
+# A path-based lesson: refuse any *.notes-secret file.
+PATH_ARM = """check_lessons() {
+  case "$1" in
+    *.notes-secret)
+      problem lesson-example-path "$1: notes files hold private notes and must not be committed. Move it outside the repo." ;; # lesson: example-path
+  esac
+}
+"""
+
+# A content-based lesson: refuse a .cfg file whose content holds a marker.
+CONTENT_ARM = """check_lessons() {
+  case "$1" in
+    *.cfg)
+      if file_content "$1" | grep -q 'DO-NOT-SHIP'; then
+        problem lesson-example-content "$1: holds a DO-NOT-SHIP marker, left in by a draft. Remove the marker before committing."  # lesson: example-content
+      fi ;;
+  esac
+}
+"""
+
+
+def yq_usable():
+    if shutil.which("yq") is None:
+        return False
+    probe = subprocess.run(["yq", "-o=json", "-I0", "."], input="a: 1\n",
+                           capture_output=True, text=True)
+    return probe.returncode == 0
+
+
+class LaneTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="agent-check-lane-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        home = self.tmp / "home"
+        home.mkdir()
+        self.env = {k: v for k, v in os.environ.items()
+                    if not k.startswith("GIT_") and k not in GITHUB_RUN_VARS}
+        self.env.update(HOME=str(home), GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1",
+                        AGENT_CHECKS_LOG="off",
+                        AGENT_CHECKS_LOCAL_USER="root", AGENT_CHECKS_LOCAL_HOST="localhost")
+
+    def git(self, repo, *args):
+        return subprocess.run(["git", *args], cwd=str(repo), env=self.env,
+                              capture_output=True, text=True, check=True).stdout
+
+    def new_repo(self, name, files=None):
+        repo = self.tmp / name
+        repo.mkdir(parents=True)
+        self.git(repo, "init", "-q", "-b", "main")
+        self.git(repo, "config", "user.name", "Example")
+        self.git(repo, "config", "user.email", "agent@example.com")
+        self.git(repo, "config", "commit.gpgsign", "false")
+        self.git(repo, "commit", "-q", "--allow-empty", "-m", "base")
+        if files:
+            self.commit(repo, files)
+        return repo
+
+    def write(self, repo, files):
+        for rel, content in files.items():
+            target = repo / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+
+    def commit(self, repo, files, message="files"):
+        self.write(repo, files)
+        self.git(repo, "add", "--", *files)
+        self.git(repo, "commit", "-q", "-m", message)
+
+    def candidate(self, arm, name="candidate"):
+        text = RUNNER.read_text(encoding="utf-8")
+        path = self.tmp / name
+        path.write_text(with_lesson_arm(text, arm), encoding="utf-8")
+        return path
+
+    def runner(self, runner, repo, *args):
+        return subprocess.run(["bash", str(runner), *args], cwd=str(repo), env=self.env,
+                              capture_output=True, text=True)
+
+    def lane(self, *args, cwd=None, env=None):
+        return subprocess.run([sys.executable, str(LANE), *args], cwd=str(cwd or REPO_ROOT),
+                              env=env or self.env, capture_output=True, text=True)
+
+    def cases_file(self, *lines, include_default=True):
+        path = self.tmp / "cases.jsonl"
+        # A candidate replaces the template's real lessons, so their own
+        # cases are left out: they would refuse nothing under it.
+        base = cases_without_lessons(CASES.read_text(encoding="utf-8")) if include_default else ""
+        path.write_text(base + "".join(line + "\n" for line in lines), encoding="utf-8")
+        return path
+
+
+class CasesTests(LaneTestCase):
+    def test_cases_pass_on_current_runner(self):
+        out = self.lane("cases", "--runner", str(RUNNER))
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn(" passed, 0 failed", out.stdout)
+        self.assertNotIn("FAIL", out.stdout)
+
+    def test_wrong_expectation_is_reported(self):
+        cases = self.cases_file(
+            '{"id": "env-wrongly-passes", "event": "pre-commit", "files": {".env": "A=1\\n"}, "expect": "pass"}',
+            include_default=False)
+        out = self.lane("cases", "--runner", str(RUNNER), "--cases", str(cases))
+        self.assertEqual(out.returncode, 1, out.stdout)
+        self.assertIn("FAIL env-wrongly-passes (expected pass, got exit 1)", out.stdout)
+
+    def test_refusal_without_the_message_is_reported(self):
+        cases = self.cases_file(
+            '{"id": "env-other-message", "event": "tree", "files": {".env": "A=1\\n"}, "expect": "refuse", "message": "no such text"}',
+            include_default=False)
+        out = self.lane("cases", "--runner", str(RUNNER), "--cases", str(cases))
+        self.assertEqual(out.returncode, 1, out.stdout)
+        self.assertIn("FAIL env-other-message (refused, but stderr lacks the expected message)", out.stdout)
+
+
+class CaseFieldTests(LaneTestCase):
+    """The ci cases' optional `pr` and the pass cases' optional `warning`."""
+
+    def run_cases(self, *lines):
+        cases = self.cases_file(*lines, include_default=False)
+        return self.lane("cases", "--runner", str(RUNNER), "--cases", str(cases))
+
+    def test_invalid_pr_and_warning_fields_are_refused(self):
+        bad = {
+            "pr on a pre-commit case": '{"id": "x", "event": "pre-commit", "files": {"a": "b"}, "pr": {"body": ""}, "expect": "pass"}',
+            "pr without body": '{"id": "x", "event": "ci", "files": {"a": "b"}, "pr": {"user_type": "User"}, "expect": "pass"}',
+            "pr unknown key": '{"id": "x", "event": "ci", "files": {"a": "b"}, "pr": {"body": "", "number": 1}, "expect": "pass"}',
+            "pr body a number": '{"id": "x", "event": "ci", "files": {"a": "b"}, "pr": {"body": 3}, "expect": "pass"}',
+            "pr empty user_type": '{"id": "x", "event": "ci", "files": {"a": "b"}, "pr": {"body": "", "user_type": ""}, "expect": "pass"}',
+            "warning on a refuse case": '{"id": "x", "event": "ci", "files": {".env": "b"}, "expect": "refuse", "message": "m", "warning": "w"}',
+            "empty warning": '{"id": "x", "event": "ci", "files": {"a": "b"}, "expect": "pass", "warning": ""}',
+        }
+        for label, line in bad.items():
+            out = self.run_cases(line)
+            self.assertEqual(out.returncode, 1, label)
+            self.assertIn("cases.jsonl:1:", out.stdout, label)
+
+    def test_missing_warning_is_reported(self):
+        out = self.run_cases('{"id": "tldr-ok", "event": "ci", "files": {"a.py": "x\\n"}, '
+                             '"pr": {"body": "## TLDR\\nAdds a retry.\\n"}, "expect": "pass", '
+                             '"warning": "agent-checks (warning):"}')
+        self.assertEqual(out.returncode, 1, out.stdout)
+        self.assertIn("FAIL tldr-ok (passed, but the output lacks the expected warning)", out.stdout)
+
+    def test_the_lanes_own_github_event_never_reaches_a_case(self):
+        # A ci case with no `pr`, run by a lane whose own environment names a
+        # pull_request event with an unreadable payload, still passes.
+        env = dict(self.env, GITHUB_EVENT_NAME="pull_request", GITHUB_ACTIONS="true",
+                   GITHUB_EVENT_PATH=str(self.tmp / "no-such-event.json"))
+        cases = self.cases_file('{"id": "ci-plain", "event": "ci", "files": {"a.py": "x\\n"}, "expect": "pass"}',
+                                include_default=False)
+        out = self.lane("cases", "--runner", str(RUNNER), "--cases", str(cases), env=env)
+        self.assertEqual(out.returncode, 0, out.stdout)
+
+
+class PrTldrRunnerTests(LaneTestCase):
+    """The runner's pr-tldr check, for what the case table cannot express."""
+
+    def setUp(self):
+        super().setUp()
+        self.repo = self.new_repo("r", {"README.md": "# Example\n"})
+
+    def run_ci(self, event_path, env=None):
+        env = dict(env or self.env, GITHUB_EVENT_NAME="pull_request", GITHUB_EVENT_PATH=str(event_path))
+        return subprocess.run(["bash", str(RUNNER), "ci", "HEAD~1", "HEAD"], cwd=str(self.repo), env=env,
+                              capture_output=True, text=True)
+
+    def event(self, payload):
+        path = self.tmp / "event.json"
+        path.write_text(payload, encoding="utf-8")
+        return path
+
+    def test_unreadable_event_file_is_refused(self):
+        out = self.run_ci(self.tmp / "no-such-event.json")
+        self.assertEqual(out.returncode, 1, out.stderr)
+        self.assertIn("agent-checks: pull request description: the event payload at GITHUB_EVENT_PATH "
+                      "could not be read", out.stderr)
+
+    def test_malformed_or_non_pull_request_payload_is_refused(self):
+        for payload in ("{not json", '{"ref": "refs/heads/main"}', '{"pull_request": "text"}'):
+            out = self.run_ci(self.event(payload))
+            self.assertEqual(out.returncode, 1, payload)
+            self.assertIn("could not be read as a pull request event", out.stderr, payload)
+
+    def test_no_node_is_refused(self):
+        nonode = self.tmp / "nonode"
+        nonode.mkdir()
+        for d in os.environ.get("PATH", "").split(os.pathsep):
+            if not os.path.isdir(d):
+                continue
+            for name in os.listdir(d):
+                src = os.path.join(d, name)
+                if name in ("node", "npm", "npx", "corepack") or (nonode / name).exists():
+                    continue
+                if os.path.isfile(src) and os.access(src, os.X_OK):
+                    (nonode / name).symlink_to(src)
+        out = self.run_ci(self.event('{"pull_request": {"body": "## TLDR\\nx\\n"}}'),
+                          env=dict(self.env, PATH=str(nonode)))
+        self.assertEqual(out.returncode, 1, out.stderr)
+        self.assertIn("pull request description: node is not on PATH", out.stderr)
+
+    def test_bot_warning_is_an_annotation_under_github_actions(self):
+        path = self.event('{"pull_request": {"body": "Bumps a pin.", "user": {"type": "Bot"}, '
+                          '"created_at": "2026-12-01T00:00:00Z"}}')
+        out = self.run_ci(path, env=dict(self.env, GITHUB_ACTIONS="true"))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("::warning::agent-checks (warning): pull request description: it does not begin",
+                      out.stderr)
+
+    def closing_output(self, body):
+        payload = json.dumps({"pull_request": {"body": body, "created_at": "2026-12-01T00:00:00Z"}})
+        out = self.run_ci(self.event(payload))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return out.stdout + out.stderr
+
+    def test_closing_keywords_are_listed_once_each_and_never_refuse(self):
+        text = self.closing_output("## TLDR\nx\n\nFixes #1, closed #1 and RESOLVES: #2.\n")
+        self.assertIn("merging this pull request closes these: #1 #2.", text)
+        self.assertIn("drop the keyword", text)
+
+    def test_a_reference_without_a_closing_keyword_does_not_warn(self):
+        # Negative control: a reference, a keyword inside a word, a keyword in
+        # a comment, and a keyword not followed by a reference all stay quiet.
+        body = ("## TLDR\nx\n\nFor #1. Related to #2. Disclosed #3. Closes the gap in #4.\n"
+                "<!-- Closes #5 -->\n")
+        self.assertNotIn("closing keyword", self.closing_output(body))
+
+    def test_the_body_is_never_printed(self):
+        path = self.event('{"pull_request": {"body": "SENTINEL-TEXT-1234 and no heading", '
+                          '"created_at": "2026-12-01T00:00:00Z"}}')
+        out = self.run_ci(path)
+        self.assertEqual(out.returncode, 1, out.stderr)
+        self.assertNotIn("SENTINEL-TEXT-1234", out.stdout + out.stderr)
+
+
+class RedGreenTests(LaneTestCase):
+    def test_good_lesson_passes(self):
+        cases = self.cases_file(
+            '{"id": "notes-refused", "lesson": "example-path", "event": "pre-commit", "files": {"a/b.notes-secret": "x\\n"}, "expect": "refuse", "message": "a/b.notes-secret: notes files hold private notes"}',
+            '{"id": "notes-near-miss", "lesson": "example-path", "event": "pre-commit", "files": {"a/b.notes": "x\\n"}, "expect": "pass"}')
+        out = self.lane("red-green", "--base", str(RUNNER), "--candidate", str(self.candidate(PATH_ARM)),
+                        "--lesson", "example-path", "--cases", str(cases))
+        self.assertEqual(out.returncode, 0, out.stdout)
+        self.assertIn("PASS red notes-refused", out.stdout)
+        self.assertIn("PASS green notes-near-miss", out.stdout)
+
+    def test_case_that_already_refuses_under_base_fails(self):
+        cases = self.cases_file(
+            '{"id": "env-tagged", "lesson": "example-path", "event": "pre-commit", "files": {".env": "A=1\\n"}, "expect": "refuse", "message": ".env: looks like a secret"}')
+        out = self.lane("red-green", "--base", str(RUNNER), "--candidate", str(self.candidate(PATH_ARM)),
+                        "--lesson", "example-path", "--cases", str(cases))
+        self.assertEqual(out.returncode, 1, out.stdout)
+        self.assertIn("FAIL red env-tagged (already refuses under the base runner", out.stdout)
+
+    def test_no_tagged_case_fails(self):
+        out = self.lane("red-green", "--base", str(RUNNER), "--candidate", str(self.candidate(PATH_ARM)),
+                        "--lesson", "example-path", "--cases", str(CASES))
+        self.assertEqual(out.returncode, 1, out.stdout)
+        self.assertIn("FAIL no case is tagged with lesson example-path", out.stdout)
+
+    def test_only_pass_cases_tagged_fails(self):
+        cases = self.cases_file(
+            '{"id": "notes-near-miss", "lesson": "example-path", "event": "pre-commit", "files": {"a/b.notes": "x\\n"}, "expect": "pass"}')
+        out = self.lane("red-green", "--base", str(RUNNER), "--candidate", str(self.candidate(PATH_ARM)),
+                        "--lesson", "example-path", "--cases", str(cases))
+        self.assertEqual(out.returncode, 1, out.stdout)
+        self.assertIn("FAIL no refuse case is tagged", out.stdout)
+
+    def test_candidate_breaking_an_existing_case_fails(self):
+        broken = PATH_ARM.replace("*.notes-secret)", "*)")
+        cases = self.cases_file(
+            '{"id": "notes-refused", "lesson": "example-path", "event": "pre-commit", "files": {"a/b.notes-secret": "x\\n"}, "expect": "refuse", "message": "notes files hold private notes"}')
+        out = self.lane("red-green", "--base", str(RUNNER), "--candidate", str(self.candidate(broken)),
+                        "--lesson", "example-path", "--cases", str(cases))
+        self.assertEqual(out.returncode, 1, out.stdout)
+        self.assertIn("FAIL green readme-passes", out.stdout)
+
+
+class RunnerTreeTests(LaneTestCase):
+    def test_tree_checks_every_path_of_a_revision(self):
+        repo = self.new_repo("r", {"README.md": "# Example\n", "certs/site.pem": "not a real cert\n"})
+        out = self.runner(RUNNER, repo, "tree")
+        self.assertEqual(out.returncode, 1, out.stderr)
+        self.assertIn("agent-checks: certs/site.pem: looks like a secret", out.stderr)
+        self.git(repo, "rm", "-q", "certs/site.pem")
+        self.git(repo, "commit", "-q", "-m", "remove")
+        self.assertEqual(self.runner(RUNNER, repo, "tree", "HEAD").returncode, 0)
+        out = self.runner(RUNNER, repo, "tree", "HEAD~1")
+        self.assertEqual(out.returncode, 1, out.stderr)
+        self.assertIn("certs/site.pem", out.stderr)
+
+    def test_tree_refuses_an_unknown_revision(self):
+        repo = self.new_repo("r", {"README.md": "# Example\n"})
+        out = self.runner(RUNNER, repo, "tree", "no-such-branch")
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("tree: 'no-such-branch' is not a commit or tree", out.stderr)
+
+
+def expected_checks(core, declared):
+    """The run-log checks a run must write: `core` with the lesson ids the
+    template declares in lesson_checks, each once and in declared order,
+    spliced in right after skill-shell, where run_checks logs them."""
+    at = core.index("skill-shell") + 1
+    return core[:at] + list(declared) + core[at:]
+
+
+def declared_lessons():
+    """The ids the real template's lesson_checks names."""
+    return runner_lesson_parts(RUNNER)[1]
+
+
+def cases_without_lessons(text):
+    """The case table's lines that are not tagged for a lesson. One case is
+    one line ended by a newline; str.splitlines() would also cut at U+2028,
+    form feeds and the like inside a case's file content."""
+    return "".join(line + "\n" for line in text.split("\n")
+                   if line.strip() and "lesson" not in json.loads(line))
+
+
+class CandidateHelperTests(unittest.TestCase):
+    """The helper that builds a candidate runner works on a template that
+    already holds lessons: the first real lesson must not break this module."""
+
+    TEMPLATE = ('before\nlesson_checks="lesson-real-one"\n\ncheck_lessons() {\n  local x\n  case "$1" in\n'
+                '    *.real)\n      if [ -n "$x" ]; then\n        problem lesson-real-one "$1: no."\n      fi ;;\n'
+                '  esac\n}\n\nafter() {\n  :\n}\n')
+
+    def test_replaces_a_non_empty_check_lessons_and_its_id_list(self):
+        out = with_lesson_arm(self.TEMPLATE, PATH_ARM, "lesson-example-path")
+        self.assertIn(PATH_ARM, out)
+        self.assertNotIn("lesson-real-one", out)
+        self.assertIn('lesson_checks="lesson-example-path"\n', out)
+        self.assertTrue(out.startswith("before\n"))
+        self.assertTrue(out.endswith("\nafter() {\n  :\n}\n"))
+
+    def test_default_clears_the_id_list(self):
+        self.assertIn('lesson_checks=""\n', with_lesson_arm(self.TEMPLATE, PATH_ARM))
+
+    def test_a_case_holding_other_line_separators_stays_one_line(self):
+        odd = json.dumps({"id": "odd", "files": {"a.txt": "one\u2028two\x0cthree\x85four"}}, ensure_ascii=False)
+        tagged = json.dumps({"id": "real", "lesson": "real-one"})
+        self.assertEqual(cases_without_lessons(odd + "\n" + tagged + "\n\n"), odd + "\n")
+
+    def test_refuses_a_template_without_check_lessons(self):
+        with self.assertRaises(AssertionError):
+            with_lesson_arm('lesson_checks=""\n', PATH_ARM)
+
+
+class ContentArmTests(LaneTestCase):
+    def setUp(self):
+        super().setUp()
+        self.cand = self.candidate(CONTENT_ARM)
+
+    def test_pre_commit_reads_the_index_not_the_worktree(self):
+        repo = self.new_repo("r")
+        self.write(repo, {"app.cfg": "mode=DO-NOT-SHIP\n"})
+        self.git(repo, "add", "app.cfg")
+        self.write(repo, {"app.cfg": "mode=release\n"})
+        out = self.runner(self.cand, repo, "pre-commit")
+        self.assertEqual(out.returncode, 1, out.stderr)
+        self.assertIn("agent-checks: app.cfg: holds a DO-NOT-SHIP marker", out.stderr)
+        self.assertNotIn("mode=", out.stderr)
+
+        self.git(repo, "add", "app.cfg")
+        self.write(repo, {"app.cfg": "mode=DO-NOT-SHIP\n"})
+        out = self.runner(self.cand, repo, "pre-commit")
+        self.assertEqual(out.returncode, 0, out.stderr)
+
+    def test_ci_reads_the_head(self):
+        repo = self.new_repo("r")
+        base = self.git(repo, "rev-parse", "HEAD").strip()
+        self.commit(repo, {"app.cfg": "mode=DO-NOT-SHIP\n", "other.cfg": "mode=release\n"})
+        out = self.runner(self.cand, repo, "ci", base, "HEAD")
+        self.assertEqual(out.returncode, 1, out.stderr)
+        self.assertIn("app.cfg: holds a DO-NOT-SHIP marker", out.stderr)
+        self.assertNotIn("other.cfg", out.stderr)
+
+    def test_tree_reads_the_named_revision(self):
+        repo = self.new_repo("r", {"app.cfg": "mode=DO-NOT-SHIP\n"})
+        self.commit(repo, {"app.cfg": "mode=release\n"})
+        self.assertEqual(self.runner(self.cand, repo, "tree", "HEAD").returncode, 0)
+        out = self.runner(self.cand, repo, "tree", "HEAD~1")
+        self.assertEqual(out.returncode, 1, out.stderr)
+        self.assertIn("app.cfg: holds a DO-NOT-SHIP marker", out.stderr)
+
+
+class LocalChecksTests(LaneTestCase):
+    """.agent-checks/local.sh: a repo's own checks, run after the fleet's."""
+
+    def test_local_check_exiting_0_cannot_suppress_a_fleet_refusal(self):
+        repo = self.new_repo("r")
+        self.write(repo, {".agent-checks/local.sh": "failed=0\nexit 0\n", ".env": "A=1\n"})
+        self.git(repo, "add", ".agent-checks/local.sh", ".env")
+        out = self.runner(RUNNER, repo, "pre-commit")
+        self.assertEqual(out.returncode, 1, out.stderr)
+        self.assertIn("agent-checks: .env: looks like a secret", out.stderr)
+
+    def test_local_check_reads_paths_rev_and_event(self):
+        script = ('rev=$AGENT_CHECKS_REV\n'
+                  'while IFS= read -r -d "" p; do\n'
+                  '  if git show "${rev}:$p" | grep -qx DRAFT; then echo "local: $1: $p is a draft" >&2; exit 3; fi\n'
+                  'done\n')
+        repo = self.new_repo("r", {".agent-checks/local.sh": script, "doc.md": "DRAFT\n"})
+        out = self.runner(RUNNER, repo, "tree", "HEAD")
+        self.assertEqual(out.returncode, 1, out.stderr)
+        self.assertIn("local: tree: doc.md is a draft", out.stderr)
+        self.assertIn("agent-checks: .agent-checks/local.sh (this repo's own checks) refused, exit 3", out.stderr)
+        # pre-commit: an empty AGENT_CHECKS_REV reads the index.
+        self.write(repo, {"doc.md": "final\n"})
+        self.git(repo, "add", "doc.md")
+        self.write(repo, {"doc.md": "DRAFT\n"})
+        out = self.runner(RUNNER, repo, "pre-commit")
+        self.assertEqual(out.returncode, 0, out.stderr)
+
+    def test_symlinked_local_check_is_not_run(self):
+        repo = self.new_repo("r")
+        (self.tmp / "outside.sh").write_text("exit 1\n", encoding="utf-8")
+        (repo / ".agent-checks").mkdir()
+        (repo / ".agent-checks" / "local.sh").symlink_to(self.tmp / "outside.sh")
+        self.write(repo, {"README.md": "# Example\n"})
+        self.git(repo, "add", "README.md")
+        self.assertEqual(self.runner(RUNNER, repo, "pre-commit").returncode, 0)
+
+
+@unittest.skipUnless(yq_usable(), "fleet-scan reads repos.yml with mikefarah yq, which is not on PATH "
+                                  "(CI's suite job installs it in its 'Install yq' step)")
+class FleetScanTests(LaneTestCase):
+    def setUp(self):
+        super().setUp()
+        self.root = self.tmp / "fleet"
+        self.repos_yml = self.tmp / "repos.yml"
+        self.repos_yml.write_text("cron_coverage:\n  fleet:\n    - alpha\n    - beta\n", encoding="utf-8")
+        # alpha already holds a file the base runner refuses: not new.
+        self.alpha = self.new_repo("fleet/alpha", {"README.md": "# Alpha\n", ".env": "A=1\n"})
+        self.beta = self.new_repo("fleet/beta", {"README.md": "# Beta\n"})
+        self.cand = self.candidate(PATH_ARM)
+
+    def scan(self):
+        return self.lane("fleet-scan", "--base", str(RUNNER), "--candidate", str(self.cand),
+                         "--root", str(self.root), "--repos-yml", str(self.repos_yml))
+
+    def test_no_new_refusal_exits_0(self):
+        out = self.scan()
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("alpha: 0 new refusal(s)", out.stdout)
+        self.assertIn("beta: 0 new refusal(s)", out.stdout)
+
+    def test_new_refusal_exits_1(self):
+        self.commit(self.beta, {"docs/plan.notes-secret": "x\n"})
+        out = self.scan()
+        self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
+        self.assertIn("beta: 1 new refusal(s)", out.stdout)
+        self.assertIn("  agent-checks: docs/plan.notes-secret: notes files", out.stdout)
+        self.assertIn("alpha: 0 new refusal(s)", out.stdout)
+
+    def test_missing_checkout_exits_2(self):
+        self.repos_yml.write_text("cron_coverage:\n  fleet:\n    - alpha\n    - beta\n    - gamma\n",
+                                  encoding="utf-8")
+        self.commit(self.beta, {"docs/plan.notes-secret": "x\n"})
+        out = self.scan()
+        self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+        self.assertIn("gamma: NOT REACHED (no checkout)", out.stdout)
+        self.assertIn("NOT REACHED: gamma", out.stdout)
+
+    def test_plain_directory_is_not_reached(self):
+        shutil.rmtree(self.beta / ".git")
+        out = self.scan()
+        self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+        self.assertIn("beta: NOT REACHED (not a git checkout)", out.stdout)
+
+
+class ScopeTests(LaneTestCase):
+    ALLOWED = {
+        "templates/agent-checks/agent-checks": "runner v1\n",
+        ".githooks/agent-checks": "runner v1\n",
+        "test/fixtures/agent-checks-cases.jsonl": "{}\n",
+        "README.md": "# Example\n",
+    }
+
+    def setUp(self):
+        super().setUp()
+        self.repo = self.new_repo("r", self.ALLOWED)
+        self.base = self.git(self.repo, "rev-parse", "HEAD").strip()
+
+    def scope(self):
+        return self.lane("scope", "--base", self.base, "--head", "HEAD", cwd=self.repo)
+
+    def test_allowed_changes_pass(self):
+        self.commit(self.repo, {"templates/agent-checks/agent-checks": "runner v2\n",
+                                ".githooks/agent-checks": "runner v2\n",
+                                "test/fixtures/agent-checks-cases.jsonl": "{}\n{}\n",
+                                "docs/agent-checks-lessons.md": "# Ledger\n"})
+        out = self.scope()
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+
+    def test_another_path_fails(self):
+        self.commit(self.repo, {"templates/agent-checks/agent-checks": "runner v2\n",
+                                ".githooks/agent-checks": "runner v2\n",
+                                "scripts/sync.sh": "echo\n"})
+        out = self.scope()
+        self.assertEqual(out.returncode, 1, out.stdout)
+        self.assertIn("scope: A scripts/sync.sh: outside the lesson-check lane's files", out.stdout)
+
+    def test_deletion_fails(self):
+        self.git(self.repo, "rm", "-q", "test/fixtures/agent-checks-cases.jsonl")
+        self.git(self.repo, "commit", "-q", "-m", "remove")
+        out = self.scope()
+        self.assertEqual(out.returncode, 1, out.stdout)
+        self.assertIn("scope: D test/fixtures/agent-checks-cases.jsonl: only adds and modifies", out.stdout)
+
+    def test_differing_runner_copies_fail(self):
+        self.commit(self.repo, {"templates/agent-checks/agent-checks": "runner v2\n"})
+        out = self.scope()
+        self.assertEqual(out.returncode, 1, out.stdout)
+        self.assertIn("is not byte-identical", out.stdout)
+
+
+LOG_KEYS = ["v", "ts", "event", "repo", "checks", "failed", "runner"]
+KEBAB = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
+
+
+class RunLogTests(LaneTestCase):
+    """The run log: one JSON line per pre-commit or pre-push run."""
+
+    def setUp(self):
+        super().setUp()
+        self.log = self.tmp / "state" / "agent-checks" / "runs.jsonl"
+        self.repo = self.new_repo("r")
+        self.git(self.repo, "remote", "add", "origin", "https://github.com/example-owner/widgets.git")
+
+    def run_logged(self, *args, log=None, stdin=None):
+        env = dict(self.env, AGENT_CHECKS_LOG=str(log or self.log))
+        return subprocess.run(["bash", str(RUNNER), *args], cwd=str(self.repo), env=env,
+                              input=stdin, capture_output=True, text=True)
+
+    def entries(self):
+        if not self.log.exists():
+            return []
+        out = []
+        for line in self.log.read_text(encoding="utf-8").splitlines():
+            entry = json.loads(line, object_pairs_hook=lambda pairs: pairs)
+            self.assertEqual([k for k, _ in entry], LOG_KEYS, line)
+            out.append(dict(entry))
+        return out
+
+    def stage(self, files):
+        self.write(self.repo, files)
+        self.git(self.repo, "add", "--", *files)
+
+    def test_passing_pre_commit_writes_one_line(self):
+        self.stage({"README.md": "# Example\n"})
+        out = self.run_logged("pre-commit")
+        self.assertEqual((out.returncode, out.stdout, out.stderr), (0, "", ""))
+        [entry] = self.entries()
+        self.assertEqual(entry["v"], 1)
+        self.assertRegex(entry["ts"], r"\A\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\Z")
+        self.assertEqual(entry["event"], "pre-commit")
+        self.assertEqual(entry["repo"], "example-owner/widgets")
+        self.assertEqual(entry["checks"], expected_checks(["secret-file", "skill-shell"], declared_lessons()))
+        self.assertEqual(entry["failed"], [])
+        self.assertEqual(entry["runner"], hashlib.sha256(RUNNER.read_bytes()).hexdigest()[:12])
+
+    def test_run_log_lessons_must_equal_the_declared_ones(self):
+        """A runner that logs a lesson twice, or one lesson_checks does not
+        name, writes a log the exact comparison rejects."""
+        loop = 'for id in $lesson_checks; do note_ran "$id"; done'
+        text = with_lesson_arm(RUNNER.read_text(encoding="utf-8"), PATH_ARM, "lesson-example-path")
+        self.assertEqual(text.count(loop), 1, "run_checks no longer logs lessons this way")
+        self.stage({"README.md": "# Example\n"})
+        want = expected_checks(["secret-file", "skill-shell"], ["lesson-example-path"])
+        for name, mutant in (("faithful", loop),):
+            self.assertEqual(self.logged_checks(text, name, loop, mutant), want)
+        for name, mutant in (
+                ("bogus and doubled", 'for id in $lesson_checks lesson-bogus; do note_ran "$id"; note_ran "$id"; done'),
+                ("bogus only", 'for id in $lesson_checks lesson-bogus; do note_ran "$id"; done'),
+                ("none logged", ":")):
+            self.assertNotEqual(self.logged_checks(text, name, loop, mutant), want, name)
+
+    def logged_checks(self, text, name, loop, mutant):
+        copy = self.tmp / name.replace(" ", "-") / "agent-checks"
+        copy.parent.mkdir()
+        copy.write_text(text.replace(loop, mutant), encoding="utf-8")
+        log = self.tmp / "state" / f"{copy.parent.name}.jsonl"
+        env = dict(self.env, AGENT_CHECKS_LOG=str(log))
+        out = subprocess.run(["bash", str(copy), "pre-commit"], cwd=str(self.repo), env=env,
+                             capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        [line] = log.read_text(encoding="utf-8").splitlines()
+        return json.loads(line)["checks"]
+
+    def test_runner_digest_follows_the_runner_file(self):
+        self.stage({"README.md": "# Example\n"})
+        copy = self.tmp / "copy" / "agent-checks"
+        copy.parent.mkdir()
+        copy.write_bytes(RUNNER.read_bytes() + b"# a later version\n")
+        env = dict(self.env, AGENT_CHECKS_LOG=str(self.log))
+        out = subprocess.run(["bash", str(copy), "pre-commit"], cwd=str(self.repo), env=env,
+                             capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        [entry] = self.entries()
+        self.assertEqual(entry["runner"], hashlib.sha256(copy.read_bytes()).hexdigest()[:12])
+        self.assertNotEqual(entry["runner"], hashlib.sha256(RUNNER.read_bytes()).hexdigest()[:12])
+
+    def test_refused_pre_commit_lists_the_check_and_keeps_the_message(self):
+        self.stage({".env": "A=1\n"})
+        silent = self.run_logged("pre-commit", log="off")
+        out = self.run_logged("pre-commit")
+        self.assertEqual(out.returncode, 1)
+        self.assertEqual((out.stdout, out.stderr), (silent.stdout, silent.stderr))
+        self.assertIn("agent-checks: .env: looks like a secret or credential file", out.stderr)
+        [entry] = self.entries()
+        self.assertEqual(entry["failed"], ["secret-file"])
+
+    def test_refused_pre_push_is_logged_as_pre_push(self):
+        self.commit(self.repo, {".env": "A=1\n"})
+        head = self.git(self.repo, "rev-parse", "HEAD").strip()
+        out = self.run_logged("pre-push", "origin", "https://github.com/example-owner/widgets.git",
+                              stdin=f"refs/heads/feature {head} refs/heads/feature {'0' * 40}\n")
+        self.assertEqual(out.returncode, 1, out.stderr)
+        self.assertIn("agent-checks: .env: looks like a secret", out.stderr)
+        [entry] = self.entries()
+        self.assertEqual(entry["event"], "pre-push")
+        self.assertEqual(entry["checks"], expected_checks(["privacy", "secret-file", "skill-shell"], declared_lessons()))
+        self.assertEqual(entry["failed"], ["secret-file"])
+
+    def test_repo_local_check_is_logged(self):
+        self.stage({".agent-checks/local.sh": "exit 3\n"})
+        out = self.run_logged("pre-commit")
+        self.assertEqual(out.returncode, 1, out.stderr)
+        [entry] = self.entries()
+        self.assertEqual(entry["checks"], expected_checks(["secret-file", "skill-shell", "repo-local"], declared_lessons()))
+        self.assertEqual(entry["failed"], ["repo-local"])
+
+    def test_ci_tree_and_unknown_events_write_nothing(self):
+        base = self.git(self.repo, "rev-parse", "HEAD").strip()
+        self.commit(self.repo, {".env": "A=1\n"})
+        self.assertEqual(self.run_logged("ci", base, "HEAD").returncode, 1)
+        self.assertEqual(self.run_logged("tree", "HEAD").returncode, 1)
+        self.assertEqual(self.run_logged("post-merge").returncode, 0)
+        self.assertFalse(self.log.exists())
+
+    def test_off_writes_nothing(self):
+        self.stage({"README.md": "# Example\n"})
+        env = dict(self.env, AGENT_CHECKS_LOG="off", XDG_STATE_HOME=str(self.tmp / "state"))
+        out = subprocess.run(["bash", str(RUNNER), "pre-commit"], cwd=str(self.repo), env=env,
+                             capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertFalse((self.tmp / "state").exists())
+
+    def test_default_path_is_under_xdg_state_home(self):
+        self.stage({"README.md": "# Example\n"})
+        env = {k: v for k, v in self.env.items() if k != "AGENT_CHECKS_LOG"}
+        env["XDG_STATE_HOME"] = str(self.tmp / "state")
+        out = subprocess.run(["bash", str(RUNNER), "pre-commit"], cwd=str(self.repo), env=env,
+                             capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(len(self.entries()), 1)
+
+    def test_unwritable_log_changes_nothing(self):
+        blocker = self.tmp / "blocker"
+        blocker.write_text("a file, so no directory can be made under it\n", encoding="utf-8")
+        for files, rc in (({"README.md": "# Example\n"}, 0), ({".env": "A=1\n"}, 1)):
+            self.stage(files)
+            silent = self.run_logged("pre-commit", log="off")
+            out = self.run_logged("pre-commit", log=blocker / "agent-checks" / "runs.jsonl")
+            self.assertEqual((out.returncode, out.stdout, out.stderr),
+                             (silent.returncode, silent.stdout, silent.stderr))
+            self.assertEqual(out.returncode, rc)
+
+    def test_repo_is_parsed_only_from_github_remotes(self):
+        self.stage({"README.md": "# Example\n"})
+        urls = {
+            "git@github.com:example-owner/widgets.git": "example-owner/widgets",
+            "ssh://git@github.com/example-owner/widgets": "example-owner/widgets",
+            "https://github.com/example-owner/my.widgets_2": "example-owner/my.widgets_2",
+            "https://gitlab.example.com/example-owner/widgets.git": None,
+            "/srv/git/widgets.git": None,
+            "https://user:pass@github.com/example-owner/widgets.git": None,
+            "https://github.com/example-owner/widgets/extra": None,
+            'https://github.com/example owner/wid"gets.git': None,
+            "git@github.com:example-owner/wid'gets\\\".git": None,
+        }
+        for url, want in urls.items():
+            self.git(self.repo, "remote", "set-url", "origin", url)
+            self.assertEqual(self.run_logged("pre-commit").returncode, 0)
+            self.assertEqual(self.entries()[-1]["repo"], want, url)
+        self.git(self.repo, "remote", "remove", "origin")
+        self.run_logged("pre-commit")
+        self.assertIsNone(self.entries()[-1]["repo"])
+        self.assertEqual(len(self.entries()), len(urls) + 1)
+
+    def test_lane_cases_write_nothing(self):
+        env = {k: v for k, v in self.env.items() if k != "AGENT_CHECKS_LOG"}
+        env["XDG_STATE_HOME"] = str(self.tmp / "state")
+        out = self.lane("cases", "--runner", str(RUNNER), env=env)
+        self.assertEqual(out.returncode, 0, out.stdout)
+        self.assertFalse((self.tmp / "state").exists())
+
+
+def canonical_runner(runner):
+    """The runner as bash itself parsed it: the whole file is wrapped in a
+    function that is defined, never called, and printed with declare -f, so
+    comments are gone and each command sits on its own line."""
+    script = 'eval "__agent_checks_all() {\n$(cat "$1")\n}" && declare -f __agent_checks_all'
+    out = subprocess.run(["bash", "-c", script, "bash", str(runner)],
+                         capture_output=True, text=True, check=True)
+    return out.stdout
+
+
+def runner_lesson_parts(runner):
+    """check_lessons as bash printed it, and the ids lesson_checks names."""
+    script = ('trap \'declare -f check_lessons; echo ===; printf "%s\\n" $lesson_checks\' EXIT; '
+              'source "$1" not-an-event')
+    out = subprocess.run(["bash", "-c", script, "bash", str(runner)],
+                         capture_output=True, text=True, check=True).stdout
+    body, _, ids = out.partition("===\n")
+    return body, ids.split()
+
+
+# Tokens after which the next word is a command name.
+COMMAND_START = {";", ";;", "&&", "||", "|", "&", "(", ")", "{", "!", "then", "do", "else", "elif",
+                 "if", "while", "until"}
+
+
+def problem_calls(text):
+    """(id token, raw line) for every `problem` command in canonical bash."""
+    calls = []
+    for raw in text.splitlines():
+        if not re.search(r"\bproblem\b", raw):
+            continue
+        lex = shlex.shlex(raw, posix=True, punctuation_chars=";&|(){}!")
+        lex.commenters = ""
+        lex.whitespace_split = True
+        tokens = list(lex)
+        for i, tok in enumerate(tokens):
+            if tok != "problem":
+                continue
+            if i > 0 and tokens[i - 1] == "function":
+                continue  # the definition
+            if i > 0 and tokens[i - 1] not in COMMAND_START:
+                raise AssertionError(f"`problem` is not at a command position: {raw.strip()}")
+            calls.append((tokens[i + 1] if i + 1 < len(tokens) else None, raw))
+    return calls
+
+
+class LocalIdentityTests(LaneTestCase):
+    """local-identity: this machine's account name in a home path, or its hostname."""
+
+    USER = "fixtureuser"
+    HOST = "FIXTUREBOX"
+
+    def setUp(self):
+        super().setUp()
+        self.repo = self.new_repo("r")
+        self.log = self.tmp / "runs.jsonl"
+
+    def check(self, text, user=None, host=None, extra=None):
+        env = dict(self.env, AGENT_CHECKS_LOCAL_USER=user if user is not None else self.USER,
+                   AGENT_CHECKS_LOCAL_HOST=host if host is not None else self.HOST,
+                   AGENT_CHECKS_LOG=str(self.log), **(extra or {}))
+        self.git(self.repo, "reset", "-q")
+        self.write(self.repo, {"notes.txt": text})
+        self.git(self.repo, "add", "--", "notes.txt")
+        return subprocess.run(["bash", str(RUNNER), "pre-commit"], cwd=str(self.repo), env=env,
+                              capture_output=True, text=True)
+
+    def assertRefused(self, text, **kw):
+        out = self.check(text, **kw)
+        self.assertEqual(out.returncode, 1, (text, out.stderr))
+        self.assertIn("agent-checks: notes.txt: line 1 holds this machine's", out.stderr)
+        self.assertNotIn(kw.get("user") or self.USER, out.stderr)
+        self.assertNotIn(kw.get("host") or self.HOST, out.stderr)
+
+    def assertPasses(self, text, **kw):
+        out = self.check(text, **kw)
+        self.assertEqual((out.returncode, out.stderr), (0, ""), text)
+
+    def test_each_user_path_form_refuses(self):
+        for form in ("/home/fixtureuser/x", "/Users/fixtureuser/x", "C:\\home\\fixtureuser\\x",
+                     "C:\\Users\\fixtureuser", "-home-fixtureuser-repos", "/home/fixtureuser"):
+            with self.subTest(form=form):
+                self.assertRefused("a " + form + "\n")
+
+    def test_doubled_backslashes_refuse(self):
+        for form in ("C:\\\\Users\\\\fixtureuser\\\\x", "\\\\home\\\\fixtureuser"):
+            with self.subTest(form=form):
+                self.assertRefused(form + "\n")
+
+    def test_the_line_number_is_reported(self):
+        out = self.check("fine\n/home/fixtureuser/x\n")
+        self.assertIn("notes.txt: line 2 holds", out.stderr)
+
+    def test_a_bare_name_or_a_longer_name_does_not_refuse(self):
+        self.assertPasses("fixtureuser wrote this\n")
+        self.assertPasses("/home/fixtureuserextra/x\n")
+        self.assertPasses("/home/fixtureuser-two/x\n")
+        self.assertPasses("/home/fixtureuser_two\n")
+        self.assertPasses("bypassxPermissions\n", user="passx")
+
+    def test_host_as_a_whole_word_refuses_in_three_cases(self):
+        for word in ("FixtureBox", "FIXTUREBOX", "fixturebox"):
+            with self.subTest(word=word):
+                self.assertRefused("ssh " + word + " now\n", host="FixtureBox")
+                self.assertRefused(word + "\n", host="FixtureBox")
+                self.assertRefused("(" + word + ").\n", host="FixtureBox")
+
+    def test_host_as_a_substring_does_not_refuse(self):
+        self.assertPasses("MYFIXTUREBOX2 and FIXTUREBOX-2 and FIXTUREBOX_x\n")
+        self.assertPasses("FixtureBoxes\n", host="FixtureBox")
+
+    def test_generic_names_are_skipped(self):
+        self.assertPasses("/home/root/x and /home/runner/x\n", user="root")
+        self.assertPasses("/home/Ubuntu/x\n", user="Ubuntu")
+        self.assertPasses("/home/ab/x\n", user="ab")
+        self.assertPasses("localhost abc 0123456789ab\n", host="localhost")
+        self.assertPasses("abc\n", host="abc")
+        self.assertPasses("0123456789ab\n", host="0123456789ab")
+        # a generic user does not hide a checkable host, and the reverse
+        self.assertRefused("/home/root and FIXTUREBOX\n", user="root")
+        self.assertRefused("/home/fixtureuser and localhost\n", host="localhost")
+
+    def test_an_empty_identity_is_not_checked_and_not_logged(self):
+        out = self.check("/home/root/x\n", user="", host="")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        [line] = self.log.read_text(encoding="utf-8").splitlines()
+        self.assertNotIn("local-identity", line)
+
+    def test_github_actions_never_runs_the_check(self):
+        out = self.check("/home/fixtureuser FIXTUREBOX\n", extra={"GITHUB_ACTIONS": "true"})
+        self.assertEqual((out.returncode, out.stderr), (0, ""))
+        [line] = self.log.read_text(encoding="utf-8").splitlines()
+        self.assertNotIn("local-identity", line)
+
+    def test_identity_is_literal_text_not_a_pattern(self):
+        self.assertRefused("see a.b+c here\n", host="a.b+c")
+        self.assertPasses("see aXbbc here\n", host="a.b+c")
+        self.assertRefused("/home/a.b+c/x\n", user="a.b+c")
+        self.assertPasses("/home/aXbbc/x\n", user="a.b+c")
+        self.assertRefused("/home/(x|y)[0]/z\n", user="(x|y)[0]")
+
+    def test_a_clean_file_passes(self):
+        self.assertPasses("# Notes\nUse /home/example/project on the build host.\n")
+
+    def test_binary_files_are_skipped(self):
+        (self.repo / "blob.bin").write_bytes(b"\x00\x01/home/fixtureuser/x\n")
+        self.git(self.repo, "add", "--", "blob.bin")
+        env = dict(self.env, AGENT_CHECKS_LOCAL_USER=self.USER, AGENT_CHECKS_LOCAL_HOST=self.HOST)
+        out = subprocess.run(["bash", str(RUNNER), "pre-commit"], cwd=str(self.repo), env=env,
+                             capture_output=True, text=True)
+        self.assertEqual((out.returncode, out.stderr), (0, ""))
+
+    def test_the_run_log_has_the_id_and_no_identity(self):
+        self.check("/home/fixtureuser/x FIXTUREBOX\n")
+        [line] = self.log.read_text(encoding="utf-8").splitlines()
+        entry = json.loads(line)
+        self.assertIn("local-identity", entry["checks"])
+        self.assertEqual(entry["failed"], ["local-identity"])
+        self.assertNotIn(self.USER, line)
+        self.assertNotIn(self.HOST, line)
+        self.assertNotIn(self.HOST.lower(), line.lower())
+
+    def test_ci_and_tree_events_read_the_commit(self):
+        base = self.git(self.repo, "rev-parse", "HEAD").strip()
+        self.commit(self.repo, {"notes.txt": "/home/fixtureuser/x\n"})
+        env = dict(self.env, AGENT_CHECKS_LOCAL_USER=self.USER, AGENT_CHECKS_LOCAL_HOST=self.HOST)
+        for args in (("ci", base, "HEAD"), ("tree", "HEAD")):
+            out = subprocess.run(["bash", str(RUNNER), *args], cwd=str(self.repo), env=env,
+                                 capture_output=True, text=True)
+            self.assertEqual(out.returncode, 1, (args, out.stderr))
+            self.assertIn("notes.txt: line 1 holds", out.stderr)
+
+
+class CheckIdTests(unittest.TestCase):
+    """Every refusal names a stable check id: the run log counts by it."""
+
+    def test_every_problem_call_passes_a_literal_kebab_case_id(self):
+        calls = problem_calls(canonical_runner(RUNNER))
+        # The kit's runner: the machinery's own three, secret-file and skill-shell (Content tiers).
+        self.assertGreaterEqual(len(calls), 5)
+        for ident, raw in calls:
+            self.assertIsNotNone(ident, raw)
+            self.assertRegex(ident, KEBAB, raw)
+            self.assertRegex(raw, r"\bproblem " + re.escape(ident) + r"(\s|;|$)",
+                             f"the id must be an unquoted literal: {raw.strip()}")
+
+    def test_core_check_ids(self):
+        ids = {ident for ident, _ in problem_calls(canonical_runner(RUNNER))}
+        self.assertLessEqual({"secret-file", "skill-shell", "repo-local", "pr-tldr", "local-identity", "privacy"}, ids)
+
+    def test_lesson_arms_and_lesson_checks_agree(self):
+        for arm in (None, PATH_ARM):
+            runner = RUNNER
+            if arm:
+                tmp = Path(tempfile.mkdtemp(prefix="agent-check-ids-"))
+                self.addCleanup(shutil.rmtree, tmp, True)
+                runner = tmp / "candidate"
+                runner.write_text(with_lesson_arm(RUNNER.read_text(encoding="utf-8"), arm, "lesson-example-path"),
+                                  encoding="utf-8")
+            body, listed = runner_lesson_parts(runner)
+            arm_ids = [ident for ident, _ in problem_calls(body)]
+            self.assertTrue(all(i.startswith("lesson-") for i in arm_ids + listed), arm_ids + listed)
+            self.assertEqual(sorted(set(arm_ids)), sorted(listed))
+            others = {i for i, _ in problem_calls(canonical_runner(runner))} - set(arm_ids)
+            self.assertFalse([i for i in others if i.startswith("lesson-")])
+
+
+if __name__ == "__main__":
+    unittest.main()
