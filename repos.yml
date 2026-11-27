@@ -75,7 +75,7 @@ skills_bootstrap:
   # one move was hand-made; `sha256` was recomputed from the bytes at `ref`.
   registry: dummy-gha/acsi-agentskills
   path: .claude/hooks/skills-bootstrap.sh
-  ref: 42f39bd8c810cfde9bab5f344b38d17fe0c5e046
+  ref: 69882ea5da69e81fbf5e4fb8627f88d39bef1309
   # sha256 of the file at `ref`. The ref is already content-addressed, so this
   # is belt-and-braces — but the artifact executes instruction text at session
   # start with no approval prompt, so "the bytes we deliver are the bytes that
