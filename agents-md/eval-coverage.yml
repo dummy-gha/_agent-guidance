@@ -107,7 +107,7 @@
   audience: owner
   status: covered
   fixture: evals/guidance/agent-contribution-markers/
-  bytes: 631
+  bytes: 619
 
 - id: pr-tldr
   heading: PR descriptions open with a TLDR
@@ -161,7 +161,7 @@
   audience: contributor
   status: covered
   fixture: evals/guidance/pinning-github-actions/
-  bytes: 1173
+  bytes: 1167
 
 - id: test-that-can-signal-kills-every-session
   heading: A test that can signal can kill every session
@@ -169,7 +169,7 @@
   audience: contributor
   status: covered
   fixture: evals/guidance/test-that-can-signal-kills-every-session/
-  bytes: 920
+  bytes: 914
 
 - id: skills-ecosystem
   heading: Skills ecosystem
@@ -183,7 +183,7 @@
     unchanged since this row was written and is still account facts). No
     freshness check reads base.md yet; that lighter check is still to build.
   since: 2026-11-03
-  bytes: 1230
+  bytes: 1224
 
 - id: two-setup-gaps
   heading: Two setup gaps you may close, and must not nag about
@@ -191,7 +191,7 @@
   audience: owner
   status: covered
   fixture: evals/guidance/two-setup-gaps/
-  bytes: 1972
+  bytes: 1966
 
 - id: git-practices
   heading: Git practices
