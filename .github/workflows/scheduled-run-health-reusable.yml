@@ -1,0 +1,119 @@
+# Scheduled-run + default-branch-push health audit (reusable), for the fleet
+# repos that pin their actions through an actions.lock.
+#
+# WHY THIS COPY EXISTS. example-site-platform's scheduled-run-health.yml reusable is
+# the original, and the repos without a lockfile still call it. GitHub's
+# workflow lockfiles went GA on 2026-10-28, and "a reusable workflow is
+# covered by the lockfile of the repository where it is defined"
+# (https://docs.github.com/actions/concepts/security/workflow-dependency-lockfiles).
+# example-site-platform has no lockfile and cannot get one yet (ADR 0024: actionlint
+# rejects `$/` local refs, and most of its local refs point into a runtime
+# checkout), so from that day every caller in a repo with the Require
+# lockfile policy startup-failed, daily and silently: skills-evals,
+# repo-settings, acsi-agentskills and this repo. example-site-a, with no
+# lockfile, kept passing on the same reusable at the same release.
+#
+# This workflow does the same job with its two actions locked in THIS repo's
+# actions.lock. Callers: this repo through
+# ./.github/workflows/scheduled-run-health-reusable.yml, the others at a full
+# commit sha of this repo (a cross-repo reusable is never locked, ADR 0024).
+#
+# WHERE THE AUDIT SCRIPT COMES FROM. The adoption kit's export (DECISIONS
+# C4) copied scripts/audit-scheduled-runs.js into this repo from the
+# platform, which is not part of the kit, and this workflow reads it from
+# THIS repo's default branch rather than from the commit a caller pinned,
+# so one merged change moves every caller. With no platform release to
+# fall behind, the platform's currency lane, the release pin and the daily
+# parity check against the platform are left out.
+#
+# Everything else matches the platform reusable: one `ci`-labelled tracking
+# issue per repo, the run stays green when it filed its alert and goes red
+# only when it could not do its job, and the next day's run reports this
+# one's own failures.
+name: Scheduled-run health audit (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      # Strings, not numbers, so a caller can wire a workflow_dispatch input
+      # straight through without type coercion (the platform reusable's rule).
+      window_hours: { type: string, default: "48" }
+      issue_label:  { type: string, default: "ci" }
+      dry_run:      { type: boolean, default: false }
+      push_scan:    { type: boolean, default: true }
+      # Failing workflow_dispatch / workflow_run / repository_dispatch /
+      # dynamic runs on the default branch, as on the platform.
+      other_scan:   { type: boolean, default: true }
+      # The label that queues the tracking issue for the fleet worker
+      # (docs/routines/fleet-worker.md). Empty turns that off.
+      work_label:   { type: string, default: "agent-ready" }
+      stale_days:   { type: string, default: "14" }
+      stale_scan:   { type: boolean, default: true }
+
+# A caller's grant caps a reusable's: the caller must give actions: read
+# (list workflow runs) and issues: write (the tracking issue).
+permissions:
+  contents: read
+  actions: read
+  issues: write
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Find the repo this reusable lives in
+        id: home
+        env:
+          # Read through toJSON(job), never ${{ job.workflow_repository }}: the
+          # same reason as the platform reusable (actionlint does not know
+          # that property yet; the runtime object carries it).
+          JOB_CONTEXT: ${{ toJSON(job) }}
+        run: |
+          repo=$(jq -r '.workflow_repository // ""' <<<"$JOB_CONTEXT")
+          if ! [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::the job context carries no usable workflow_repository ('${repo}'); refusing to guess where the audit script lives."
+            exit 1
+          fi
+          echo "repository=$repo" >>"$GITHUB_OUTPUT"
+      - name: Fetch the audit script from that repo's default branch
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: ${{ steps.home.outputs.repository }}
+          sparse-checkout: |
+            scripts/audit-scheduled-runs.js
+          sparse-checkout-cone-mode: false
+          path: .self
+          persist-credentials: false
+      - name: Setup Node
+        uses: actions/setup-node@v7.1.0
+        with:
+          node-version: "20"
+      - name: Audit scheduled-run health
+        # Flags are built in shell from env, never with an inline `a && b || c`
+        # expression: GitHub returns `c` whenever `b` is an empty string, which
+        # once turned the push scan off unconditionally (example-site-platform run
+        # 32280743541). `if` blocks, not `[[ ]] && ...`, because `run:` is
+        # `bash -e`.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AUDIT_REPO: ${{ github.repository }}
+          AUDIT_WINDOW_HOURS: ${{ inputs.window_hours }}
+          AUDIT_LABEL: ${{ inputs.issue_label }}
+          AUDIT_DRY_RUN: ${{ inputs.dry_run }}
+          AUDIT_PUSH_SCAN: ${{ inputs.push_scan }}
+          AUDIT_OTHER_SCAN: ${{ inputs.other_scan }}
+          AUDIT_WORK_LABEL: ${{ inputs.work_label }}
+          AUDIT_STALE_DAYS: ${{ inputs.stale_days }}
+          AUDIT_STALE_SCAN: ${{ inputs.stale_scan }}
+        run: |
+          # The caller's repo is passed explicitly: only the script is checked
+          # out, so gh cannot infer the repo from a local remote.
+          args=(--repo "$AUDIT_REPO" --window-hours "$AUDIT_WINDOW_HOURS" --label "$AUDIT_LABEL")
+          if [[ "$AUDIT_DRY_RUN" == "true" ]]; then args+=(--dry-run); fi
+          if [[ "$AUDIT_PUSH_SCAN" != "true" ]]; then args+=(--no-push-scan); fi
+          if [[ "$AUDIT_OTHER_SCAN" != "true" ]]; then args+=(--no-other-scan); fi
+          if [[ -n "$AUDIT_WORK_LABEL" ]]; then args+=(--work-label "$AUDIT_WORK_LABEL"); fi
+          args+=(--stale-days "$AUDIT_STALE_DAYS")
+          if [[ "$AUDIT_STALE_SCAN" != "true" ]]; then args+=(--no-stale-scan); fi
+          node .self/scripts/audit-scheduled-runs.js "${args[@]}"

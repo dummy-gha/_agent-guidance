@@ -1,0 +1,2803 @@
+#!/usr/bin/env bash
+set -euo pipefail
+#
+# sync.sh — Sync the managed AGENTS.md to every repo in the organization.
+#
+# Discovers repos dynamically via `gh repo list`. For each repo the script:
+#   1. Reads the repo's .agents-sync.yml (sections to include)
+#   2. Builds the managed portion via build-agents-md.sh
+#   3. Preserves any content below "## Repo-specific additions"
+#   4. Ensures a CLAUDE.md bridge exists (creates it if absent; warns — or
+#      rewrites when opted in via fix_claude_md — if present but broken)
+#   5. Delivers the skills-bootstrap SessionStart hook to ALLOWLISTED repos
+#      that already carry their own skills.lock (see repos.yml and
+#      docs/decisions/0001) — never to every repo, and never writing the lock
+#   6. Retires the owner-only guidance files (ADR 0043): removes
+#      .claude/hooks/fleet-guidance.md, fleet-memory.sh and
+#      guidance-load-record.sh from a repo that still has them, with exactly
+#      the settings.json registrations this sync wrote for them (matched by
+#      command string; every other entry, and a settings.json it cannot parse,
+#      is left untouched). The owner's routes install the guidance instead
+#   7. Ensures the root .gitattributes pins .claude/hooks/*.sh to LF (one
+#      appended line; see docs/decisions/0019) and marks .githooks/** and
+#      .claude/hooks/** linguist-vendored (ADR 0048)
+#   8. Pushes the update directly to the default branch (the sync App has a
+#      ruleset bypass, declared in repo-settings); falls back to a PR with
+#      auto-merge for repos whose protection rejects the push
+#
+# Requirements: gh (GitHub CLI, authenticated), yq, git, python3
+# Usage:        ./scripts/sync.sh [--dry-run]
+#
+# Environment:
+#   SYNC_OWNERS              — space-separated list of owners to scan; when
+#                               set, takes precedence over
+#                               GITHUB_REPOSITORY_OWNER and the git-remote
+#                               fallback (e.g. "dummy-gha dummy-gha")
+#   GITHUB_REPOSITORY_OWNER — org/user to scan (auto-set in GitHub Actions)
+#   SYNC_SELF_REPO          — this repo's name, excluded from sync (default: _agent-guidance)
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+BUILD_SCRIPT="$SCRIPT_DIR/build-agents-md.sh"
+BRIDGE_SCRIPT="$SCRIPT_DIR/bridge-status.sh"
+BOOTSTRAP_STATUS_SCRIPT="$SCRIPT_DIR/bootstrap-status.sh"
+REGISTER_SCRIPT="$SCRIPT_DIR/register-bootstrap-hook.sh"
+# Delivers "disableSkillShellExecution": true (ADR 0029), same posture as the
+# registrar: append a key, never overwrite, refuse an unparseable file.
+SKILL_SHELL_SCRIPT="$SCRIPT_DIR/set-skill-shell-setting.sh"
+HOOK_REL_PATH=".claude/hooks/skills-bootstrap.sh"
+SETTINGS_REL_PATH=".claude/settings.json"
+LOCK_REL_PATH="skills.lock"
+# The owner-only guidance (ADR 0043) no longer ships in consumer repos. These
+# three files were delivered here until then; the sync now REMOVES them, with
+# the registrations it wrote for them. RETIRED_REGISTRATIONS rows are
+# `event|command`, the exact strings the sync used to write.
+FLEET_HOOK_REL_PATH=".claude/hooks/fleet-memory.sh"
+FLEET_PAYLOAD_REL_PATH=".claude/hooks/fleet-guidance.md"
+GREC_REL_PATH=".claude/hooks/guidance-load-record.sh"
+RETIRED_FILES=("$FLEET_HOOK_REL_PATH" "$FLEET_PAYLOAD_REL_PATH" "$GREC_REL_PATH")
+RETIRED_REGISTRATIONS=(
+    'SessionStart|bash "$CLAUDE_PROJECT_DIR/.claude/hooks/fleet-memory.sh"'
+    'Stop|bash "$CLAUDE_PROJECT_DIR/.claude/hooks/guidance-load-record.sh"'
+)
+UNREGISTER_SCRIPT="$SCRIPT_DIR/unregister-hook.sh"
+# The contributor rules (ADR 0043): the generated subset of base.md an outside
+# contributor's agent needs, read on demand and never imported by AGENTS.md.
+# Delivered byte for byte to EVERY synced repo in both AGENTS_MD_MODE values;
+# it does not depend on `.claude/` or settings.json.
+CONTRIBUTOR_REL_PATH=".github/fleet-contributor-rules.md"
+CONTRIBUTOR_SOURCE="$REPO_ROOT/.github/fleet-contributor-rules.md"
+CONTRIBUTOR_HEADER="<!-- Managed by _agent-guidance"
+# The one managed line in each repo's root .gitattributes that keeps the hook
+# scripts above LF in every checkout, so bash in WSL can parse them from a
+# Windows-autocrlf clone. Owned by GITATTR_SCRIPT; see docs/decisions/0019.
+GITATTR_REL_PATH=".gitattributes"
+GITATTR_SCRIPT="$SCRIPT_DIR/hook-eol-gitattributes.sh"
+# The Dependabot merge path every synced repo needs (fleet.yml turns Dependabot
+# security updates on everywhere), MANAGED like the agent-checks runner: added
+# when missing and overwritten when it drifts from the template, when
+# repos.yml's dependabot_auto_merge.deliver is true. The template has no uses:
+# lines and no helper script, so an actions.lock repo takes it too. See the
+# block in repos.yml for the carve-outs (example-site-platform and its callers).
+AUTOMERGE_TEMPLATE_DIR="$REPO_ROOT/templates/dependabot-auto-merge"
+AUTOMERGE_WF_REL_PATH=".github/workflows/dependabot-auto-merge.yml"
+# The managed .github/dependabot.yml (ADR 0047), delivered when repos.yml's
+# dependabot_config.deliver is true, only to repos whose own file covers
+# nothing but github-actions (or is already this template). Same carve-outs
+# as the auto-merge workflow above.
+DEPCFG_TEMPLATE="$REPO_ROOT/templates/dependabot/dependabot.yml"
+DEPCFG_REL_PATH=".github/dependabot.yml"
+DEPCFG_HEADER="# Managed by _agent-guidance's templates/dependabot/"
+DEPCFG_MANIFEST_REL_PATH=".githooks/dated-phrasing/package.json"
+# A repo that pins actions through `gh actions-lock` keeps a lockfile naming
+# every workflow; `gh actions-lock --no-fix` rejects one without an entry for
+# a workflow file, or with a dependency no workflow lists. Overwriting the
+# workflow without touching the lockfile broke 17 repos, so the lane edits
+# both (scripts/actions-lock-entry.sh holds the text transform).
+ACTIONS_LOCK_REL_PATH=".github/workflows/actions.lock"
+# SYNC_TEST_ACTIONS_LOCK_SCRIPT exists ONLY so test/run-tests.sh can stub a
+# helper whose `apply` fails after `check` passed. Nothing in production sets
+# it; unset, the real helper runs.
+ACTIONS_LOCK_SCRIPT="${SYNC_TEST_ACTIONS_LOCK_SCRIPT:-$SCRIPT_DIR/actions-lock-entry.sh}"
+# The agent-checks lane (ADR 0021), on when repos.yml's agent_checks.deliver is
+# true. The runner and the Claude Code guard are MANAGED (overwritten whenever
+# they drift); the CI workflow is ADDED once and never
+# overwritten, like the Dependabot one, so Dependabot can keep its pin current.
+AGENT_CHECKS_TEMPLATE_DIR="$REPO_ROOT/templates/agent-checks"
+AC_RUNNER_REL_PATH=".githooks/agent-checks"
+AC_WF_REL_PATH=".github/workflows/agent-checks.yml"
+AC_GUARD_REL_PATH=".claude/hooks/agent-checks-guard.sh"
+AC_GUARD_MATCHER="Bash|Edit|Write|MultiEdit|NotebookEdit"
+# The runner's sidecar files: the dated-phrasing warning pass (its script, the
+# fleet allowlist, and the package files that pin its one dependency) and the
+# privacy check's Python denylist matcher. MANAGED like the runner,
+# delivered at the same relative path under .githooks/ as under the template
+# directory, so the runner finds them beside itself in both places.
+AC_DATED_FILES=(dated-phrasing.js dated-phrasing-allowlist.txt
+                dated-phrasing/package.json dated-phrasing/package-lock.json
+                privacy-denylist.py)
+# ── privacy-comment-alert lane (issue #636) ──
+# Rides the agent_checks.deliver switch. The scan script is MANAGED under
+# .githooks/ (beside privacy-denylist.py, which it imports); the workflow is
+# ADDED once and never overwritten, like agent-checks.yml.
+PCA_TEMPLATE_DIR="$REPO_ROOT/templates/privacy-comment-alert"
+PCA_SCAN_REL_PATH=".githooks/privacy-comment-scan.py"
+PCA_WF_REL_PATH=".github/workflows/privacy-comment-alert.yml"
+# The runner is run by bash from git hooks, so a CRLF checkout breaks it the
+# same way it breaks the .claude/hooks scripts (ADR 0019): a second managed line.
+AC_EOL_LINE='.githooks/* text eol=lf'
+AC_EOL_COMMENT='# managed by _agent-guidance: the agent-checks runner must stay LF for bash (see ADR 0021)'
+# The files the sync delivers under these two directories are tooling copied
+# from this repo, yet GitHub's linguist counted them as each repo's own code:
+# most repos read "Shell 80%, JavaScript 19%". Marking them vendored keeps the
+# language bar, and the language-fit check that reads it, about the repo's own
+# code (ADR 0048). Two more managed lines, appended like the LF ones.
+LINGUIST_LINES=('.githooks/** linguist-vendored' '.claude/hooks/** linguist-vendored')
+LINGUIST_COMMENT='# managed by _agent-guidance: synced tooling is vendored, not this repo'"'"'s code (see ADR 0048)'
+MARKER="## Repo-specific additions"
+# Codex's `project_doc_max_bytes` default (codex-rs/core/src/agents_md.rs,
+# codex-cli 0.154.0, measured 2026-09-14). Same constant in
+# check-agents-md.sh and drift-report.sh; the three gates must not drift apart.
+CODEX_PROJECT_DOC_MAX_BYTES=32768
+BRANCH_NAME="agents-md-sync/update"
+# The committer identity every commit this sync makes is written under (set on
+# each clone below) AND the identity the PR-fallback force-push guard
+# recognises as its own work. One constant because those two must never drift:
+# were the commits written under one address and the guard looking for another,
+# the guard would read this sync's own stale branch as a stranger's and refuse
+# every repo it had ever proposed to.
+SYNC_BOT_EMAIL="agents-md-sync[bot]@users.noreply.github.com"
+DRY_RUN=false
+WORK_DIR=$(mktemp -d)
+SELF_REPO="${SYNC_SELF_REPO:-_agent-guidance}"
+
+# Resolve the owner(s) to scan: SYNC_OWNERS (space-separated) takes
+# precedence, then GITHUB_REPOSITORY_OWNER, then fall back to git remote.
+if [[ -n "${SYNC_OWNERS:-}" ]]; then
+    read -ra OWNERS <<< "$SYNC_OWNERS"
+elif [[ -n "${GITHUB_REPOSITORY_OWNER:-}" ]]; then
+    OWNERS=("$GITHUB_REPOSITORY_OWNER")
+else
+    OWNERS=("$(git remote get-url origin | sed -E 's#.*/([^/]+)/[^/]+\.git$#\1#; s#.*/([^/]+)/[^/]+$#\1#')")
+fi
+
+REPOS_YML="${REPOS_YML:-$REPO_ROOT/repos.yml}"
+
+trap 'rm -rf "$WORK_DIR"' EXIT
+
+# Parsed as a closed set rather than sniffed, exactly as bump-consumer-locks.sh
+# and bump-hook-pin.sh do and for the same reason. `[[ "${1:-}" == "--dry-run" ]]`
+# alone fails OPEN: `-n`, `--dry-runn`, and the flag given anywhere but first
+# all left DRY_RUN=false, and the run then went on to clone every repo in the
+# fleet, commit, push STRAIGHT to their default branches (this sync holds a
+# ruleset bypass, so protection does not catch it) and force-push a branch —
+# while the operator who typed the flag believed nothing was written. A flag
+# whose whole meaning is "write nothing" has to fail CLOSED, so an argument
+# this script does not recognise stops it. After the trap, so a usage exit
+# still removes the work directory.
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dry-run) DRY_RUN=true ;;
+        -h|--help)
+            echo "Usage: $(basename "${BASH_SOURCE[0]}") [--dry-run]"
+            echo "Environment: see the header of this script."
+            exit 0
+            ;;
+        *)
+            echo "ERROR: unknown argument '$1'." >&2
+            echo "Usage: $(basename "${BASH_SOURCE[0]}") [--dry-run]" >&2
+            exit 2
+            ;;
+    esac
+    shift
+done
+
+# ── yq preflight ───────────────────────────────────────────────────────────
+#
+# THE INCIDENT, and it is one missing guard wearing two costumes. Every
+# repos.yml read in this repo was spelled `yq ... 2>/dev/null || true`, which
+# collapses three different answers into one: the key is legitimately absent,
+# yq could not parse the file, and yq is not installed at all. Only the first
+# is normal; `|| true` turned the other two into an EMPTY LIST, exit 0, and
+# not one line in the log. An empty exclusion list is not an inert one —
+# sync.sh's filter then matches nothing, and the run clones a repo repos.yml
+# excludes and pushes the managed AGENTS.md straight to its default branch,
+# which is the contamination that exclusion exists to prevent. Measured with
+# a `yq` stubbed to exit 1: drift-report.sh printed "Found 1 repo(s)" and
+# reported on the excluded repo, where the same run with a working yq printed
+# "excluded by repos.yml" and "Found 0 repo(s)".
+#
+# The second costume is FLAVOUR, and it is why the probe below runs a command
+# instead of reading a version string. Two unrelated programs install as
+# `yq`: mikefarah's Go one, which this repo's workflows fetch version-pinned
+# and digest-verified (docs/decisions/0008; Test 7h holds all four copies of
+# that step identical), and kislyuk's Python wrapper around jq, which Debian
+# ships as `yq` and which forwards `-o=json` to jq and dies with "jq: Unknown
+# option -o=json" — a message that blames repos.yml for a tool problem, and
+# the message the nightly hook-pin bump actually died with. `-o=json -I0` is
+# the exact invocation bump-hook-pin.sh's round-trip check depends on, so
+# probing it asks the question this repo really has, and asks it once, up
+# front, rather than letting the answer arrive as an empty array or a
+# misattributed parse error halfway down.
+#
+# THIS BLOCK IS DUPLICATED VERBATIM in sync.sh, drift-report.sh,
+# bump-consumer-locks.sh and bump-hook-pin.sh. All four are standalone entry
+# points and only one of them sources anything today (a file about pull
+# request prose), so a library existing solely to hold this guard would be an
+# abstraction invented for one `if`. The four copies must move together.
+if ! command -v yq >/dev/null 2>&1; then
+    echo "::error::yq is not on PATH, and this script reads repos.yml with it." >&2
+    echo "::error::Install mikefarah yq (https://github.com/mikefarah/yq) — CI installs it version-pinned and digest-verified in the 'Install yq' step of .github/workflows/{ci,sync,drift-report,skills-lock-bump}.yml." >&2
+    exit 2
+fi
+if ! printf 'a: 1\n' | yq -o=json -I0 . >/dev/null 2>&1; then
+    # Captured rather than echoed straight through, and branched, so that
+    # "yq --version itself fell over" and "yq --version answered something
+    # unexpected" stay separate sentences instead of both reaching the log as
+    # an empty string. The flavour is then named as the LIKELY cause, not
+    # asserted: all this run established is that the probe failed, and a
+    # sentence claiming more than the run established is the defect
+    # lib/bump-pr-claims.sh exists to make unwritable.
+    if ! yq_found=$(yq --version 2>&1); then
+        yq_found="'yq --version' itself failed: ${yq_found:-no output}"
+    else
+        yq_found="'yq --version' says: ${yq_found:-no output}"
+    fi
+    echo "::error::the yq on PATH does not accept '-o=json -I0', which this script's repos.yml reads need — $yq_found" >&2
+    echo "::error::This repo requires mikefarah's Go yq; a 'yq' that rejects that flag is usually kislyuk's Python jq-wrapper, which Debian ships under the same name. CI installs the required one version-pinned and digest-verified in the 'Install yq' step of .github/workflows/{ci,sync,drift-report,skills-lock-bump}.yml." >&2
+    exit 2
+fi
+
+# The contributor rules are delivered to every repo (ADR 0043). A missing or
+# empty source would otherwise read as "nothing to deliver" and stay green while
+# the whole fleet silently goes without; stop before touching any repo.
+if [[ ! -s "$CONTRIBUTOR_SOURCE" ]]; then
+    echo "::error::$CONTRIBUTOR_SOURCE is missing or empty — the sync delivers it to every repo; regenerate it with 'node scripts/build-contributor-rules.js'." >&2
+    exit 2
+fi
+
+# ── Helpers ────────────────────────────────────────────────────────────────
+
+log()  { echo "  $*"; }
+fail() { echo "  ERROR: $*"; }
+
+# Writes the standard two-line CLAUDE.md bridge (imports @AGENTS.md) to the
+# current directory. Shared by both the "CLAUDE.md absent" and the opted-in
+# "rewrite a broken bridge" paths so the byte-for-byte content can't drift
+# between them.
+write_bridge_claude_md() {
+    cat > CLAUDE.md <<'CLAUDEEOF'
+<!-- Managed by _agent-guidance: bridges Claude Code (which reads CLAUDE.md) to AGENTS.md. -->
+@AGENTS.md
+CLAUDEEOF
+}
+
+FAIL_COUNT=0
+OK_COUNT=0
+SKIP_COUNT=0
+
+# retry_read <err_file> <stop_on_404> <cmd...>
+# Runs a read, stderr to <err_file>, stdout echoed. A failed read is retried
+# after each delay in SYNC_READ_RETRY_DELAYS (default "2 4 8" seconds, 14 in
+# all) so one transient API error does not count a repo as failed (issue 428).
+# With <stop_on_404> true a 404 is final and not retried: for the file read a
+# 404 is the ordinary "no .agents-sync.yml" answer. The last attempt's stderr
+# stays in <err_file> and its exit code is returned.
+retry_read() {
+    local err_file=$1 stop_404=$2 out rc i=0
+    local -a delays
+    read -r -a delays <<< "${SYNC_READ_RETRY_DELAYS:-2 4 8}"
+    shift 2
+    while :; do
+        rc=0
+        out=$("$@" 2>"$err_file") || rc=$?
+        [[ $rc -eq 0 || $i -ge ${#delays[@]} ]] && break
+        if [[ "$stop_404" == true ]] && { grep -qF '(HTTP 404)' "$err_file" \
+              || [[ "$out" =~ \"status\":[[:space:]]*\"404\" ]]; }; then
+            break
+        fi
+        sleep "${delays[$i]}"
+        i=$((i + 1))
+    done
+    printf '%s' "$out"
+    return "$rc"
+}
+
+# pick_diagnostic <producer> <file> — the ONE line of a captured stderr that a
+# one-line failure report should quote.
+#
+# Every caller has the same shape: a command's stderr was redirected to a file
+# so the failure could be named without quoting the command's STDOUT, which on
+# a gh HTTP error is the API's raw response body — and AGENTS.md ("Sanitize
+# error output") forbids putting one of those in a public log. Separating the
+# streams settled WHICH STREAM to quote. It left open WHICH LINE, and `head -1`
+# is wrong for both producers this repo captures, in OPPOSITE directions. That
+# is why the producer is a parameter and not one rule:
+#
+#   gh    — gh's ordinary notices are `gh: `-prefixed too and are written
+#           BEFORE the error it is being asked about, so the first line is the
+#           notice and the operator is sent after the wrong fault. gh writes
+#           its own status as `gh: <message> (HTTP <code>)`, so that line is
+#           preferred, then any `gh: ` line, then the first non-blank line.
+#   tool  — python3 and yq write their warnings and traces FIRST and the fatal
+#           line LAST: a traceback ends in `SomeError: message`, and argparse
+#           prints its `usage:` banner first and `<prog>: error: ...` last. So
+#           the LAST non-blank line is the one that says what went wrong.
+#
+# Measured with the twelve stderr shapes these callers actually see (a
+# deprecation notice then `gh: Not Found (HTTP 404)`; an auth-expiry warning
+# then `(HTTP 403)`; a bare `(HTTP 401)`; a line gh did not write; empty; a
+# yq deprecation then `Error:`; an argparse usage banner then `: error: `; a
+# python traceback): `gh` picks the status line in each gh case and `tool` the
+# fatal line in each tool case, where plain `head -1` picks the notice and the
+# usage banner.
+#
+# Blank lines are skipped in EVERY branch, which is not tidiness: measured on
+# a stderr of "real error\n\n\n", plain `tail -1` quotes the empty string, and
+# on "\n\nmock gh: boom\n" plain `head -1` does the same. A producer that pads
+# its stderr would otherwise be reported as having said nothing.
+#
+# An unknown producer returns 2 with a message rather than an empty string,
+# because it can only be a construction error here: every call site passes a
+# literal.
+#
+# This is NOT generator_error_line's job, which stays where it is in
+# bump-consumer-locks.sh: that one reads a captured STRING of the lock
+# generator's MERGED output and additionally knows that generator's own
+# `ERROR:` marker. This one reads a stderr FILE.
+#
+# Duplicated in sync.sh, drift-report.sh, bump-consumer-locks.sh and
+# bump-hook-pin.sh for the reason given above the yq preflight, and it must
+# move with them.
+pick_diagnostic() {
+    local producer="$1" file="$2" line
+    # A file the caller never created (its mktemp failed) is not a fault here;
+    # the caller reports that itself, and it has no diagnostic to quote.
+    [[ -r "$file" ]] || return 0
+    case "$producer" in
+        gh)
+            line=$(grep -m1 '^gh: .*(HTTP ' "$file" \
+                || grep -m1 '^gh: ' "$file" \
+                || grep -m1 -v '^[[:space:]]*$' "$file" \
+                || true)
+            ;;
+        tool)
+            # `|| true` inside the substitution because `set -o pipefail` makes
+            # a grep that selected nothing (an empty or all-blank stderr) fail
+            # the whole pipeline.
+            line=$(grep -v '^[[:space:]]*$' "$file" | tail -1 || true)
+            ;;
+        *)
+            echo "::error::pick_diagnostic: unknown producer '$producer'" >&2
+            return 2
+            ;;
+    esac
+    printf '%s' "$line"
+}
+
+# read_repos_yml <yq expression> — the one way this script reads repos.yml.
+#
+# It exists to keep apart three answers the old `yq ... 2>/dev/null || true`
+# spelling collapsed into one: a key that is legitimately absent (yq prints
+# nothing and exits 0 — a normal empty result, which each caller's `[[ -n ]]`
+# guard already handles), a repos.yml yq cannot parse, and a yq that fell
+# over. Only a NON-ZERO EXIT is a failure, and a failure now stops the run,
+# because the lists read through here decide which repos this script writes
+# to: a silently empty one is not a smaller run, it is a run against the
+# wrong set.
+#
+# Command substitution, never `< <(...)`. Process substitution discards the
+# exit status of the command inside it, so simply dropping `|| true` from one
+# of those reads would have changed the visible behaviour not at all — the
+# same trap named beside the `gh repo list` capture further down. The `exit 2`
+# below leaves only the substitution's subshell on its own; what stops the run
+# is `set -e` seeing the assignment that captured it come back non-zero, so
+# every caller must assign the result rather than pipe it.
+#
+# Duplicated in sync.sh, drift-report.sh, bump-consumer-locks.sh and
+# bump-hook-pin.sh for the reason given above the yq preflight, and it must
+# move with them.
+read_repos_yml() {
+    local expr="$1" out err err_file rc=0
+    # Streams captured SEPARATELY. `2>&1` answered the failure path's question
+    # by corrupting the success path's answer: yq writes to stderr while
+    # exiting 0 (deprecation and expression warnings), and everything this
+    # returns is PARSED — the exclusion list, default_sections, the
+    # skills_bootstrap allowlist and its registry pin. Not a hypothetical
+    # stderr: the mikefarah yq this repo pins answers `-j` with the right value
+    # on stdout, "Flag --tojson has been deprecated" on stderr, and exit 0
+    # (measured, v4.44.3). Measured with a yq wrapper that prints one "[WARN]"
+    # line to stderr and then succeeds: sync.sh logged "Sections: yq: [WARN]
+    # this expression syntax is deprecated rust" for a repo whose sections are
+    # "rust", and "WARN: could not fetch yq: [WARN] ... — skills-bootstrap not
+    # delivered this run."
+    if ! err_file=$(mktemp -p "$WORK_DIR"); then
+        echo "::error::repos.yml: could not create a temp file for yq's diagnostics" >&2
+        exit 2
+    fi
+    out=$(yq -r "$expr" "$REPOS_YML" 2>"$err_file") || rc=$?
+    # Read and removed UNCONDITIONALLY, before the branch, so the success path
+    # cannot leak the file either.
+    err=$(pick_diagnostic tool "$err_file")
+    rm -f "$err_file"
+    if [[ $rc -ne 0 ]]; then
+        echo "::error::repos.yml: yq failed reading '$expr' — ${err:-no output}" >&2
+        exit 2
+    fi
+    printf '%s\n' "$out"
+}
+
+# ── Load central repos.yml (exclusions + default sections) ─────────────────
+#
+# A repos.yml this script cannot FIND is a refusal, not an empty config — the
+# same guard bump-hook-pin.sh carries, and for the reason the yq preflight
+# above spells out at length. `read_repos_yml` was given teeth so that a
+# repos.yml yq could not parse would stop the run; absence walked straight past
+# it, because `if [[ -f "$REPOS_YML" ]]` simply skipped both reads and left
+# EXCLUDED_REPOS empty with nothing in the log. That is the identical outcome,
+# and the identical blast radius: the exclusion filter then matches nothing and
+# the run clones a repo repos.yml excludes and pushes the managed AGENTS.md
+# straight to its default branch. Measured against the suite's own fixtures —
+# pointed at the real file, a dry run prints "testorg/repo-excluded — excluded
+# by repos.yml" and "Found 1 repo(s)"; pointed one character off, the same run
+# prints "Found 2 repo(s)", opens "=== testorg/repo-excluded ===", clones it,
+# and exits 0 with nothing to tell it apart from a healthy run. A renamed file,
+# a mis-set REPOS_YML and a checkout that never landed all arrive here.
+if [[ ! -f "$REPOS_YML" ]]; then
+    echo "::error::no repos.yml at $REPOS_YML — refusing to run, because the exclusions and default sections that decide which repos this sync writes to are read from it." >&2
+    exit 2
+fi
+
+EXCLUDED_REPOS=()
+DEFAULT_SECTIONS=()
+
+excluded_raw=$(read_repos_yml '.exclude // [] | .[]')
+while IFS= read -r r; do
+    [[ -n "$r" ]] && EXCLUDED_REPOS+=("$r")
+done <<< "$excluded_raw"
+
+default_sections_raw=$(read_repos_yml '.default_sections // [] | .[]')
+while IFS= read -r s; do
+    [[ -n "$s" ]] && DEFAULT_SECTIONS+=("$s")
+done <<< "$default_sections_raw"
+
+# ── skills-bootstrap hook delivery config ──────────────────────────────────
+# Opt-in, allowlisted, and double-keyed: a repo gets the hook only if it is
+# named in repos.yml's skills_bootstrap.repos AND already carries its own
+# skills.lock. See docs/decisions/0001. Absent config = the feature is simply
+# off, which is what keeps this an additive change for every existing repo.
+
+BOOTSTRAP_REPOS=()
+BOOTSTRAP_REGISTRY=""
+BOOTSTRAP_PATH=""
+BOOTSTRAP_REF=""
+BOOTSTRAP_SHA256=""
+
+# No existence check here: the guard above already refused a missing repos.yml,
+# so by this point the file is known to be present and readable. An absent
+# skills_bootstrap BLOCK is still perfectly normal, and stays the "feature off"
+# case below — that is a key legitimately missing from a file we did read, not
+# a file we never found.
+BOOTSTRAP_REGISTRY=$(read_repos_yml '.skills_bootstrap.registry // ""')
+BOOTSTRAP_PATH=$(read_repos_yml '.skills_bootstrap.path // ""')
+BOOTSTRAP_REF=$(read_repos_yml '.skills_bootstrap.ref // ""')
+BOOTSTRAP_SHA256=$(read_repos_yml '.skills_bootstrap.sha256 // ""')
+
+bootstrap_repos_raw=$(read_repos_yml '.skills_bootstrap.repos // [] | .[]')
+while IFS= read -r r; do
+    [[ -n "$r" ]] && BOOTSTRAP_REPOS+=("$r")
+done <<< "$bootstrap_repos_raw"
+
+# Enabled only when the pin is fully specified. A half-filled block (a ref
+# with no digest, say) must not silently deliver unverified bytes.
+BOOTSTRAP_ENABLED=false
+if [[ -n "$BOOTSTRAP_REGISTRY" && -n "$BOOTSTRAP_PATH" \
+      && -n "$BOOTSTRAP_REF" && -n "$BOOTSTRAP_SHA256" \
+      && ${#BOOTSTRAP_REPOS[@]} -gt 0 ]]; then
+    BOOTSTRAP_ENABLED=true
+fi
+
+BOOTSTRAP_BLOB=""          # path to the fetched, verified hook; "" until fetched
+BOOTSTRAP_FETCH_WARNED=false
+
+# ── Dependabot auto-merge workflow delivery config ─────────────────────────
+# A single switch, read like every other repos.yml key. Anything but a literal
+# `true` is off: a typo must not start writing workflow files fleet-wide.
+AUTOMERGE_ENABLED=false
+if [[ "$(read_repos_yml '.dependabot_auto_merge.deliver // false')" == "true" ]]; then
+    if [[ -s "$AUTOMERGE_TEMPLATE_DIR/dependabot-auto-merge.yml" ]]; then
+        AUTOMERGE_ENABLED=true
+    else
+        echo "::warning::repos.yml turns on dependabot_auto_merge.deliver, but $AUTOMERGE_TEMPLATE_DIR is missing a template — not delivering it this run." >&2
+    fi
+fi
+
+# ── Dependabot config delivery config ─────────────────────────────────────
+# Same posture: only a literal `true` turns it on.
+DEPCFG_ENABLED=false
+if [[ "$(read_repos_yml '.dependabot_config.deliver // false')" == "true" ]]; then
+    if [[ -s "$DEPCFG_TEMPLATE" ]]; then
+        DEPCFG_ENABLED=true
+    else
+        echo "::warning::repos.yml turns on dependabot_config.deliver, but $DEPCFG_TEMPLATE is missing — not delivering it this run." >&2
+    fi
+fi
+
+# ── agent-checks delivery config ──────────────────────────────────────────
+# Same posture as the switch above: only a literal `true` turns it on.
+AGENT_CHECKS_ENABLED=false
+if [[ "$(read_repos_yml '.agent_checks.deliver // false')" == "true" ]]; then
+    AGENT_CHECKS_ENABLED=true
+    for ac_template in agent-checks agent-checks.yml agent-checks-guard.sh "${AC_DATED_FILES[@]}"; do
+        [[ -s "$AGENT_CHECKS_TEMPLATE_DIR/$ac_template" ]] || AGENT_CHECKS_ENABLED=false
+    done
+    if ! $AGENT_CHECKS_ENABLED; then
+        echo "::warning::repos.yml turns on agent_checks.deliver, but $AGENT_CHECKS_TEMPLATE_DIR is missing a template — not delivering it this run." >&2
+    fi
+fi
+
+# ── privacy-comment-alert delivery (rides agent_checks.deliver) ──────────────
+PCA_ENABLED=false
+if $AGENT_CHECKS_ENABLED; then
+    PCA_ENABLED=true
+    for pca_template in privacy-comment-scan.py privacy-comment-alert.yml; do
+        [[ -s "$PCA_TEMPLATE_DIR/$pca_template" ]] || PCA_ENABLED=false
+    done
+    $PCA_ENABLED || echo "::warning::$PCA_TEMPLATE_DIR is missing a template — not delivering the privacy-comment-alert lane this run." >&2
+fi
+
+# ── agent-checks workflow trigger (ADR 0021, 2026-11-02 addendum) ──────────
+# The workflow is added once and never overwritten, so a repo that received it
+# before the runner's pr-tldr check has a bare `pull_request:` trigger, and an
+# edit to a pull request's description would not re-run the check. These two
+# functions make the one narrow edit the sync allows itself in that file:
+# adding `edited` to the pull_request trigger's types. The shape is read with
+# yq, never a regex. The edit is lexical (one line inserted, or one word added
+# to a one-line flow list), so comments and layout survive, and yq then proves
+# that nothing but those types changed, or the original bytes are restored.
+
+# ac_trigger_status <workflow> — prints current, missing-edited, or
+# "skipped: <why>" for a shape this lane does not edit.
+ac_trigger_status() {
+    local wf="$1" got
+    got=$(yq '.on | type' "$wf" 2>/dev/null) || { echo "skipped: yq could not parse it"; return 0; }
+    [[ "$got" == '!!map' ]] || { echo "skipped: its on: is not a map of triggers"; return 0; }
+    got=$(yq '.on | has("pull_request")' "$wf" 2>/dev/null) || got=""
+    [[ "$got" == true ]] || { echo "skipped: it has no pull_request trigger"; return 0; }
+    got=$(yq '.on.pull_request | type' "$wf" 2>/dev/null) || got=""
+    case "$got" in
+        '!!null') echo missing-edited; return 0 ;;
+        '!!map') ;;
+        *) echo "skipped: its pull_request trigger is not a map"; return 0 ;;
+    esac
+    got=$(yq '.on.pull_request.types | type' "$wf" 2>/dev/null) || got=""
+    case "$got" in
+        '!!null') echo missing-edited ;;
+        '!!seq')
+            got=$(yq '.on.pull_request.types | any_c(. == "edited")' "$wf" 2>/dev/null) || got=""
+            case "$got" in
+                true) echo current ;;
+                false) echo missing-edited ;;
+                *) echo "skipped: yq could not read its pull_request types" ;;
+            esac ;;
+        *) echo "skipped: its pull_request types are not a list" ;;
+    esac
+}
+
+# The lexical edit ac_trigger_patch makes, run by python3 with the workflow
+# and a mode. insert: a `    types: [...]` line right after the one
+# `  pull_request:` line under top-level `on:`. flow: `edited` added to the
+# one single-line `types: [...]` list in that trigger's block, after `opened`
+# when it is listed. Any other shape prints why and exits 1, writing nothing.
+AC_TRIGGER_EDIT_PY=""
+IFS= read -r -d '' AC_TRIGGER_EDIT_PY <<'EDIT_PY' || true
+import re
+import sys
+
+path, mode = sys.argv[1], sys.argv[2]
+
+
+def stop(why):
+    print(why)
+    sys.exit(1)
+
+
+with open(path, "rb") as fh:
+    lines = fh.read().decode("utf-8").splitlines(keepends=True)
+on = [i for i, line in enumerate(lines) if re.fullmatch(r"on:[ \t]*(#.*)?\r?\n?", line)]
+if len(on) != 1:
+    stop("it has no single top-level `on:` line")
+end = on[0] + 1
+while end < len(lines) and (not lines[end].strip() or lines[end][:1] in (" ", "\t", "#")):
+    end += 1
+pr = [i for i in range(on[0] + 1, end)
+      if re.fullmatch(r"  pull_request:[ \t]*(#.*)?\r?\n?", lines[i])]
+if len(pr) != 1:
+    stop("it has no single `  pull_request:` line under `on:`")
+at = pr[0]
+eol = "\r\n" if lines[at].endswith("\r\n") else "\n"
+if mode == "insert":
+    if not lines[at].endswith("\n"):
+        lines[at] += eol
+    lines.insert(at + 1, "    types: [opened, edited, reopened, synchronize]" + eol)
+else:
+    block = at + 1
+    while block < end and (not lines[block].strip() or lines[block].startswith("   ")
+                           or lines[block].lstrip().startswith("#")):
+        block += 1
+    shape = r"([ \t]+types:[ \t]*\[)([^\]\n]*)(\][ \t]*(#.*)?\r?\n?)"
+    hits = [i for i in range(at + 1, block) if re.fullmatch(shape, lines[i])]
+    if len(hits) != 1:
+        stop("its pull_request types are not one single-line [ ... ] list")
+    m = re.fullmatch(shape, lines[hits[0]])
+    items = [s.strip() for s in m.group(2).split(",") if s.strip()]
+    names = [s.strip("'\"") for s in items]
+    items.insert(names.index("opened") + 1 if "opened" in names else 0, "edited")
+    lines[hits[0]] = m.group(1) + ", ".join(items) + m.group(3)
+with open(path, "wb") as fh:
+    fh.write("".join(lines).encode("utf-8"))
+EDIT_PY
+
+# ac_trigger_patch <workflow> — add `edited` to the pull_request types of a
+# workflow ac_trigger_status called missing-edited. Prints "patched", or
+# "skipped: <why>" with the file's original bytes put back.
+ac_trigger_patch() {
+    local wf="$1" mode backup why before after before_types after_types want edited
+    local norm='.on.pull_request = (.on.pull_request // {}) | del(.on.pull_request.types)'
+    mode=insert
+    [[ "$(yq '.on.pull_request.types | type' "$wf" 2>/dev/null)" == '!!seq' ]] && mode=flow
+    backup=$(mktemp -p "$WORK_DIR") || { echo "skipped: could not create a temp file"; return 0; }
+    cp "$wf" "$backup"
+    before=$(yq -o=json -I0 "$norm" "$wf" 2>/dev/null) || before=""
+    before_types=$(yq -o=json -I0 '.on.pull_request.types // []' "$wf" 2>/dev/null) || before_types=""
+    if ! why=$(python3 -c "$AC_TRIGGER_EDIT_PY" "$wf" "$mode" 2>&1); then
+        cp "$backup" "$wf"; rm -f "$backup"
+        echo "skipped: ${why:-the edit failed}"
+        return 0
+    fi
+    after=$(yq -o=json -I0 "$norm" "$wf" 2>/dev/null) || after=""
+    after_types=$(yq -o=json -I0 '.on.pull_request.types // [] | map(select(. != "edited"))' "$wf" 2>/dev/null) || after_types=""
+    edited=$(yq '.on.pull_request.types | any_c(. == "edited")' "$wf" 2>/dev/null) || edited=""
+    want=$before_types
+    [[ "$mode" == insert ]] && want='["opened","reopened","synchronize"]'
+    if [[ -n "$before" && "$before" == "$after" && -n "$want" && "$after_types" == "$want" && "$edited" == true ]]; then
+        rm -f "$backup"
+        echo patched
+    else
+        cp "$backup" "$wf"; rm -f "$backup"
+        echo "skipped: after the edit yq did not read the same workflow with edited added, so the file was restored"
+    fi
+}
+
+# ── agent-checks: the PRIVACY_DENYLIST secret in the delivered workflow ──────
+# The runner's ci-mode privacy scan (templates/agent-checks/agent-checks) reads
+# the PRIVACY_DENYLIST secret from its environment, and a secret reaches a step
+# only through that step's env:. The workflow is delivered once and never
+# overwritten, so an existing copy needs the one line added. Same approach as the
+# trigger patch: the shape is read with yq, the edit is lexical (an `env:` block
+# gets a line, or a step with none gets a two-line one, right before its `run:`),
+# and yq then proves nothing but that key was added, or the bytes are restored.
+
+AC_SECRET_LINE='PRIVACY_DENYLIST: ${{ secrets.PRIVACY_DENYLIST }}'
+AC_SECRET_STEP='.jobs[].steps[] | select(.run != null and (.run | test("\\.githooks/agent-checks ci")))'
+
+# ac_secret_status <workflow> — prints current, missing-secret, or
+# "skipped: <why>" for a shape this lane does not edit.
+ac_secret_status() {
+    local wf="$1" got
+    got=$(yq "[$AC_SECRET_STEP] | length" "$wf" 2>/dev/null) || { echo "skipped: yq could not parse it"; return 0; }
+    if [[ "$got" == 0 ]]; then
+        # A thin caller (a job with `uses:` and no steps) runs the runner in the
+        # reusable workflow it calls, which owns the secret; there is no step
+        # here to patch, and a comment naming the runner is not one.
+        got=$(yq '[.jobs[] | select(.uses != null and .steps == null)] | length' "$wf" 2>/dev/null) || got=""
+        if [[ -n "$got" && "$got" != 0 ]]; then echo "n/a"; return 0; fi
+        got=0
+    fi
+    [[ "$got" == 1 ]] || { echo "skipped: it has no single step running .githooks/agent-checks ci"; return 0; }
+    got=$(yq "$AC_SECRET_STEP | .env | type" "$wf" 2>/dev/null) || got=""
+    case "$got" in
+        '!!null'|'!!map') ;;
+        *) echo "skipped: that step's env is not a map"; return 0 ;;
+    esac
+    got=$(yq "$AC_SECRET_STEP | .env | has(\"PRIVACY_DENYLIST\")" "$wf" 2>/dev/null) || got=""
+    case "$got" in
+        true) echo current ;;
+        false) echo missing-secret ;;
+        *) echo "skipped: yq could not read that step's env" ;;
+    esac
+}
+
+# The lexical edit ac_secret_patch makes, run by python3 with the workflow and
+# the line to add. The step's `run:` line must be a key of its own (not
+# `- run:`), found once. With an `env:` block (not an inline map) the line goes
+# first in it, at the block's indent; with none, `env:` and the line go
+# right before `run:`. Anything else prints why and exits 1, writing nothing.
+AC_SECRET_EDIT_PY=""
+IFS= read -r -d '' AC_SECRET_EDIT_PY <<'EDIT_PY' || true
+import re
+import sys
+
+path, entry = sys.argv[1], sys.argv[2]
+
+
+def stop(why):
+    print(why)
+    sys.exit(1)
+
+
+with open(path, "rb") as fh:
+    lines = fh.read().decode("utf-8").splitlines(keepends=True)
+runs = [i for i, line in enumerate(lines)
+        if re.match(r"[ ]+run:[ \t]+.*\.githooks/agent-checks ci(\s|$)", line)]
+if len(runs) != 1:
+    stop("it has no single `run:` line of its own running .githooks/agent-checks ci")
+at = runs[0]
+indent = re.match(r"[ ]*", lines[at]).group(0)
+eol = "\r\n" if lines[at].endswith("\r\n") else "\n"
+lo = at
+while lo > 0 and (not lines[lo - 1].strip() or lines[lo - 1].startswith(indent)
+                  or lines[lo - 1].lstrip().startswith("#")):
+    lo -= 1
+hi = at + 1
+while hi < len(lines) and (not lines[hi].strip() or lines[hi].startswith(indent)
+                           or lines[hi].lstrip().startswith("#")):
+    hi += 1
+envs = [i for i in range(lo, hi) if re.fullmatch(re.escape(indent) + r"env:[ \t]*(#.*)?\r?\n?", lines[i])]
+if len(envs) > 1:
+    stop("that step has more than one env: line")
+if envs:
+    nxt = envs[0] + 1
+    child = re.match(r"([ ]+)\S", lines[nxt]) if nxt < len(lines) else None
+    if not child or len(child.group(1)) <= len(indent):
+        stop("its env: block is not a plain block map")
+    if not lines[envs[0]].endswith("\n"):
+        lines[envs[0]] += eol
+    lines.insert(envs[0] + 1, child.group(1) + entry + eol)
+else:
+    if any(re.match(re.escape(indent) + r"env:", lines[i]) for i in range(lo, hi)):
+        stop("that step's env: is not a block it can add to")
+    lines[at:at] = [indent + "env:" + eol, indent + "  " + entry + eol]
+with open(path, "wb") as fh:
+    fh.write("".join(lines).encode("utf-8"))
+EDIT_PY
+
+# ac_secret_patch <workflow> — add the PRIVACY_DENYLIST env line to a workflow
+# ac_secret_status called missing-secret. Prints "patched", or "skipped: <why>"
+# with the file's original bytes put back.
+ac_secret_patch() {
+    local wf="$1" backup why before after got
+    local norm='del(.jobs[].steps[].env.PRIVACY_DENYLIST) | del(.jobs[].steps[] | select(has("env") and (.env | length) == 0) | .env)'
+    backup=$(mktemp -p "$WORK_DIR") || { echo "skipped: could not create a temp file"; return 0; }
+    cp "$wf" "$backup"
+    before=$(yq -o=json -I0 "$norm" "$wf" 2>/dev/null) || before=""
+    if ! why=$(python3 -c "$AC_SECRET_EDIT_PY" "$wf" "$AC_SECRET_LINE" 2>&1); then
+        cp "$backup" "$wf"; rm -f "$backup"
+        echo "skipped: ${why:-the edit failed}"
+        return 0
+    fi
+    after=$(yq -o=json -I0 "$norm" "$wf" 2>/dev/null) || after=""
+    got=$(yq "$AC_SECRET_STEP | .env.PRIVACY_DENYLIST" "$wf" 2>/dev/null) || got=""
+    if [[ -n "$before" && "$before" == "$after" && "$got" == '${{ secrets.PRIVACY_DENYLIST }}' ]]; then
+        rm -f "$backup"
+        echo patched
+    else
+        cp "$backup" "$wf"; rm -f "$backup"
+        echo "skipped: after the edit yq did not read the same workflow with the secret added, so the file was restored"
+    fi
+}
+
+bootstrap_allowlisted() {
+    local short="${1##*/}" entry
+    for entry in ${BOOTSTRAP_REPOS[@]+"${BOOTSTRAP_REPOS[@]}"}; do
+        [[ "$short" == "$entry" ]] && return 0
+    done
+    return 1
+}
+
+# ensure_bootstrap_blob — fetch the pinned hook once per run, verify its digest.
+#
+# Called from inside the owner loop rather than before it, because the token
+# that can read the registry is the PER-OWNER one resolved there (sync.yml
+# exports no shared GH_TOKEN). It is retried on each owner until it succeeds,
+# so owner ordering cannot decide whether the hook is available.
+#
+# Two failure modes, deliberately different:
+#   • fetch failed  — transient/permissions. Warn once, leave the feature on,
+#     retry next owner; repos simply don't get the hook this run.
+#   • digest mismatch — the bytes at the pinned commit are not the bytes that
+#     were reviewed. Hard-disable delivery for the run and fail it.
+ensure_bootstrap_blob() {
+    $BOOTSTRAP_ENABLED || return 1
+    [[ -n "$BOOTSTRAP_BLOB" ]] && return 0
+
+    local encoded dest actual
+    dest="$WORK_DIR/skills-bootstrap.sh"
+
+    if ! encoded=$(gh api \
+        "repos/$BOOTSTRAP_REGISTRY/contents/$BOOTSTRAP_PATH?ref=$BOOTSTRAP_REF" \
+        --jq '.content' 2>/dev/null) || [[ -z "$encoded" ]]; then
+        if ! $BOOTSTRAP_FETCH_WARNED; then
+            log "WARN: could not fetch $BOOTSTRAP_REGISTRY/$BOOTSTRAP_PATH@${BOOTSTRAP_REF:0:7} — skills-bootstrap not delivered this run."
+            BOOTSTRAP_FETCH_WARNED=true
+        fi
+        return 1
+    fi
+
+    if ! echo "$encoded" | base64 -d > "$dest" 2>/dev/null; then
+        log "WARN: could not decode $BOOTSTRAP_PATH@${BOOTSTRAP_REF:0:7} — skills-bootstrap not delivered this run."
+        rm -f "$dest"
+        return 1
+    fi
+
+    actual=$(sha256sum "$dest" | cut -d' ' -f1)
+    if [[ "$actual" != "$BOOTSTRAP_SHA256" ]]; then
+        fail "skills-bootstrap digest mismatch at ${BOOTSTRAP_REF:0:7}: repos.yml says ${BOOTSTRAP_SHA256:0:12}…, fetched ${actual:0:12}…. Delivery disabled for this run."
+        BOOTSTRAP_ENABLED=false
+        ((FAIL_COUNT++)) || true
+        rm -f "$dest"
+        return 1
+    fi
+
+    BOOTSTRAP_BLOB="$dest"
+    log "skills-bootstrap: pinned hook fetched from $BOOTSTRAP_REGISTRY@${BOOTSTRAP_REF:0:7} (digest OK)."
+    return 0
+}
+
+# Base GH_TOKEN captured before the per-owner loop, so each iteration can
+# restore it when the owner has no per-owner token of its own (owner A's
+# per-owner token must not leak into owner B's iteration).
+BASE_GH_TOKEN="${GH_TOKEN:-}"
+
+# ── Scan each owner ──────────────────────────────────────────────────────
+
+for ORG in "${OWNERS[@]}"; do
+
+# ── Resolve per-owner token ──────────────────────────────────────────────
+# GH_TOKEN_<OWNER>, where <OWNER> is $ORG uppercased with - and . mapped to
+# _ (e.g. dummy-gha -> GH_TOKEN_DUMMY_GHA). Falls back to the base
+# GH_TOKEN captured above; if neither is set, GH_TOKEN is left unset so gh's
+# ambient auth (locally) or failure (in CI) behaves as it did before.
+per_owner_var="GH_TOKEN_$(echo "$ORG" | tr '[:lower:]-.' '[:upper:]__')"
+per_owner_token="${!per_owner_var:-}"
+if [[ -n "$per_owner_token" ]]; then
+    export GH_TOKEN="$per_owner_token"
+    log "Using per-owner token for $ORG"
+elif [[ -n "$BASE_GH_TOKEN" ]]; then
+    export GH_TOKEN="$BASE_GH_TOKEN"
+else
+    unset GH_TOKEN || true
+fi
+
+# Best-effort, at most once per run (see the function's comment for why it is
+# attempted here and not before the owner loop).
+ensure_bootstrap_blob || true
+
+# ── Discover repos ─────────────────────────────────────────────────────────
+
+echo "Scanning repos for: $ORG (excluding $SELF_REPO)"
+echo ""
+
+# Captured through a command substitution, never process substitution: <(...)
+# silently swallows the error and the script would report success while doing
+# nothing. The failure branch is explicit because a bare `set -e` death here is
+# the wrong shape too — sync.yml mints one App token per owner with
+# continue-on-error, and its verify step promises that a failed mint only means
+# "its repos will be skipped this run", but it exports no base GH_TOKEN. So a
+# failed mint leaves GH_TOKEN unset, this `gh repo list` exits non-zero and,
+# with SYNC_OWNERS ordered "dummy-gha dummy-gha", the run ends on the
+# FIRST owner: the second owner is never scanned and no "=== Sync complete ==="
+# summary is printed. Counted per owner instead, so the run still goes red at
+# the end and names the owner it could not read, after serving every owner it
+# could.
+#
+# Streams captured SEPARATELY, for the reason read_repos_yml gives above: what
+# this returns is the FLEET, split into $REPOS and looped over, so a line gh
+# writes to stderr while exiting 0 — a deprecation notice, an auth-expiry
+# warning — does not merely decorate the log, it becomes a repository NAME.
+# `sed '/^$/d'` is no defence: the injected line is not blank. Measured against
+# this script with a gh stubbed to print one "gh: warning: your token will
+# expire soon" line to stderr and one real repo to stdout, exit 0 — merged, the
+# run printed "Found 2 repo(s):", opened "=== gh: warning: your token will
+# expire soon ===", tried to read .agents-sync.yml from a path built out of the
+# warning and ended "0 synced, 0 skipped, 2 failed"; separated, it prints
+# "Found 1 repo(s)" and syncs it. mktemp is checked because this owner loop
+# counts per-owner failures rather than aborting the fleet — under `set -e` an
+# unchecked assignment here would end the run before the next owner is scanned,
+# which is the exact failure the paragraph above exists to prevent.
+if ! repo_list_err_file=$(mktemp -p "$WORK_DIR"); then
+    fail "$ORG: could not create a temp file to capture gh's diagnostics"
+    ((FAIL_COUNT++)) || true
+    continue
+fi
+repo_list_rc=0
+repo_list_raw=$(
+    gh repo list "$ORG" \
+        --no-archived \
+        --source \
+        --json nameWithOwner \
+        --limit 1000 \
+        --jq '.[].nameWithOwner' 2>"$repo_list_err_file"
+) || repo_list_rc=$?
+# Read and removed unconditionally, before the branch, so the `continue` below
+# cannot leak the file and the success path cannot either.
+repo_list_err=$(pick_diagnostic gh "$repo_list_err_file")
+rm -f "$repo_list_err_file"
+if [[ $repo_list_rc -ne 0 ]]; then
+    fail "$ORG: could not list repos — ${repo_list_err:-no diagnostic output from gh}"
+    ((FAIL_COUNT++)) || true
+    continue
+fi
+
+mapfile -t REPOS < <(echo "$repo_list_raw" | grep -v "/${SELF_REPO}$" | sed '/^$/d' | sort)   # drop the blank line an empty owner produces
+
+# ── Filter repos excluded via repos.yml ─────────────────────────────────────
+if [[ ${#EXCLUDED_REPOS[@]} -gt 0 ]]; then
+    FILTERED_REPOS=()
+    for r in "${REPOS[@]}"; do
+        short_name="${r##*/}"
+        excluded=false
+        for ex in "${EXCLUDED_REPOS[@]}"; do
+            [[ "$short_name" == "$ex" ]] && excluded=true && break
+        done
+        if $excluded; then
+            echo "  $r — excluded by repos.yml"
+        else
+            FILTERED_REPOS+=("$r")
+        fi
+    done
+    REPOS=("${FILTERED_REPOS[@]}")
+fi
+
+if [[ ${#REPOS[@]} -eq 0 ]]; then
+    echo "No repos found in $ORG — nothing to sync."
+    continue
+fi
+
+echo "Found ${#REPOS[@]} repo(s):"
+printf '  %s\n' "${REPOS[@]}"
+echo ""
+
+# ── Main loop ──────────────────────────────────────────────────────────────
+
+for repo_name in "${REPOS[@]}"; do
+    echo "=== $repo_name ==="
+
+    # ── Resolve sections from repo's .agents-sync.yml ──────────────────
+
+    sections=()
+
+    # This one call carries three hazards. Two were in the shape it used to
+    # have, and it got the second of them wrong in a way that WRITES; the third
+    # arrived with the fix for the other two, which is why it is described last.
+    #
+    # The stdout half, which the old comment had right: on an HTTP error gh api
+    # prints the raw error JSON body to stdout — the --jq filter is not applied
+    # — so `|| true` alone would leave that body in remote_yaml and break the
+    # base64 decode.
+    #
+    # The status half, which `2>/dev/null` + `remote_yaml=""` quietly threw
+    # away: the exit status is the ONLY thing separating "this repo ships no
+    # .agents-sync.yml" from "the credential could not read it". Discard it and
+    # every 401, 403, 429, 5xx, DNS or TLS failure is reported as a fact the run
+    # never established, and the run then REBUILDS that repo's AGENTS.md from
+    # DEFAULT_SECTIONS, sees the content change, and commits and pushes it —
+    # sync.sh is the one script of the four that writes. Measured with a stubbed
+    # gh: with .agents-sync.yml readable (sections: python, docker) the run logs
+    # "Sections: python docker"; with the same call answering "gh: API rate
+    # limit exceeded (HTTP 403)" it logs "Sections: none", counts no failure and
+    # exits 0 — indistinguishable from a repo that genuinely has none. The
+    # managed build for [python docker] is 43,955 bytes against 42,796 for [],
+    # so 1,159 bytes of guidance this repo opted INTO would be stripped and
+    # pushed. The same disambiguation bump-consumer-locks.sh makes over
+    # skills.lock, for the same reason.
+    #
+    # The STREAM half, which the fix for those two introduced by reaching for
+    # `2>&1` so the diagnostic could be quoted: `2>&1` applies on SUCCESS too,
+    # and it answers the failure path's question by corrupting the success
+    # path's answer. gh writes to stderr while exiting 0 in ordinary conditions
+    # — deprecation notices, auth warnings — and a merged capture folds those
+    # lines into the base64 payload that is decoded and parsed below. Measured
+    # with a gh stubbed to print one "gh: this API endpoint is deprecated" line
+    # to stderr and the correct content to stdout, exit 0: merged, the run
+    # reported "could not read the sections from .agents-sync.yml — base64:
+    # invalid input" and counted the repo FAILED; separated, it reports
+    # "Sections: python docker". A healthy repo turned into a failure by a
+    # notice that changed nothing.
+    #
+    # So: stdout stays the file, stderr goes to $api_err_file, and only the
+    # failure path reads it. mktemp is checked because this loop counts per-repo
+    # failures rather than aborting the fleet — under `set -e` an unchecked
+    # assignment here would end the run for every repo after this one.
+    if ! api_err_file=$(mktemp -p "$WORK_DIR"); then
+        fail "$repo_name: could not create a temp file to capture gh's diagnostics"
+        ((FAIL_COUNT++)) || true
+        continue
+    fi
+    api_rc=0
+    remote_yaml=$(retry_read "$api_err_file" true gh api "repos/$repo_name/contents/.agents-sync.yml" \
+        --jq '.content') || api_rc=$?
+    # BOTH reads happen here, unconditionally, so no `continue` below can leak
+    # the file and neither can the success path; the two values are only ever
+    # USED in the failure branch. Same shape as drift-report.sh's
+    # fetch_file_content, which reads the same endpoint.
+    #
+    # $api_stderr is the WHOLE stderr, and it is read for one thing only: the
+    # "(HTTP 404)" needle below, which must match the status wherever in the
+    # stderr it lands. $api_err is the ONE line the operator is shown — gh's
+    # own diagnostic, and only gh's, because on an HTTP error gh prints the
+    # API's raw error body to stdout with the --jq filter unapplied and the
+    # house rule forbids echoing a response body into a public log (AGENTS.md,
+    # "Sanitize error output"). Which line that is, and why the status one is
+    # preferred over the merely first, is pick_diagnostic's comment; the
+    # measurement that put it there was taken here, with a gh stubbed to print
+    # "gh: this API endpoint is deprecated" then "gh: API rate limit exceeded
+    # (HTTP 403)" and exit 1, which reported "could not read .agents-sync.yml —
+    # gh: this API endpoint is deprecated" and sent the operator after the wrong
+    # fault. Only the message changed: the 404 disambiguation still reads
+    # $api_stderr entire.
+    api_stderr=$(cat "$api_err_file")
+    api_err=$(pick_diagnostic gh "$api_err_file")
+    rm -f "$api_err_file"
+
+    if [[ $api_rc -ne 0 ]]; then
+        # A 404 on the PATH is the only outcome that MAY mean "absent", and even
+        # it means that only once the REPO itself answers: GitHub replies 404
+        # rather than 403 when a credential is not authorized to know a thing
+        # exists, so an unprobed 404 is as much a scope gap as a missing file
+        # (AGENTS.md, "A GitHub 404 means 'not authorized', not 'not there'").
+        # Both surfaces of the status are matched because only one of them may
+        # reach us, and separating the streams is what lets each be read where
+        # it actually lands: gh's own line carries "(HTTP 404)" on stderr, while
+        # the API's error body carries "status":"404" on stdout — which, on this
+        # path, is what $remote_yaml holds.
+        if [[ "$api_stderr" != *"(HTTP 404)"* \
+              && ! "$remote_yaml" =~ \"status\":[[:space:]]*\"404\" ]]; then
+            fail "$repo_name: could not read .agents-sync.yml — ${api_err:-no diagnostic output from gh}"
+            ((FAIL_COUNT++)) || true
+            continue
+        fi
+
+        # The probe that tells the two 404s apart. It asks about the REPO, not
+        # the file: a repo that answers has told us the credential can see it
+        # and the file really is not there, whereas a repo that 404s too has
+        # told us nothing about the file at all.
+        #
+        # Streams SEPARATED, and this call is why the paragraph above must be
+        # read as a claim about the contents read alone: it was left on `2>&1`
+        # when that one was converted, so "with the streams separated that body
+        # is no longer in reach of this message" was true twenty lines up and
+        # false here. `2>&1` puts whatever gh writes to STDOUT into the captured
+        # value, and an HTTP error is exactly where gh has the API's raw error
+        # body to write — which the `head -1` fallback then quoted verbatim into
+        # a public run log, the thing AGENTS.md ("Sanitize error output")
+        # forbids. Rather than rely on which of `--silent` and the error path
+        # wins, stdout is discarded outright and only stderr is kept.
+        if ! probe_err_file=$(mktemp -p "$WORK_DIR"); then
+            fail "$repo_name: could not create a temp file to capture the repo probe's diagnostics"
+            ((FAIL_COUNT++)) || true
+            continue
+        fi
+        probe_rc=0
+        retry_read "$probe_err_file" false gh api "repos/$repo_name" --silent >/dev/null || probe_rc=$?
+        # Read then removed unconditionally, before the branch, so neither the
+        # `continue` below nor the success path can leak the file.
+        probe_stderr=$(cat "$probe_err_file")
+        probe_err=$(pick_diagnostic gh "$probe_err_file")
+        rm -f "$probe_err_file"
+        if [[ $probe_rc -ne 0 ]]; then
+            # The probe FAILING is not the same answer as the probe saying 404,
+            # and only the second one establishes a scope gap. This branch used
+            # to assert "and so did the repo itself" for every non-zero exit —
+            # so a 403, a 5xx or a DNS failure was reported to the operator as a
+            # 404-and-404, which is a claim the run never made. Same rule as the
+            # file read above it: name what was established, not what would be
+            # convenient.
+            if [[ "$probe_stderr" == *"(HTTP 404)"* ]]; then
+                fail "$repo_name: .agents-sync.yml answered 404 and so did the repo itself — a scope gap, not a missing file — ${probe_err:-no diagnostic output from gh}"
+            else
+                fail "$repo_name: .agents-sync.yml answered 404, and the repo probe that tells a scope gap from a missing file did not answer either — this run established neither — ${probe_err:-no diagnostic output from gh}"
+            fi
+            ((FAIL_COUNT++)) || true
+            continue
+        fi
+
+        # Genuinely absent, established rather than assumed: the repo answered
+        # and the file did not. This is the commonest outcome in the fleet, and
+        # the one the default_sections fallback below exists for.
+        remote_yaml=""
+    fi
+
+    if [[ -n "$remote_yaml" ]]; then
+        # Captured, never `< <(...)`: process substitution discards the exit
+        # status of the command inside it, which is what let a file that ARRIVED
+        # COMPLETE but did not PARSE reach the fallback as an empty section list
+        # — the same wrong answer the 403 above produced, reached a different
+        # way, and pushed just the same. A malformed .agents-sync.yml is a
+        # repo-authored file and a normal thing to encounter, not a defensive
+        # edge case. Measured with a stubbed gh serving unparseable YAML: the
+        # run logged "Sections: none" and exited 0. `set -o pipefail` is what
+        # makes one capture answer for both stages, so a base64 body that is not
+        # a file is refused here too rather than decoding to nothing.
+        #
+        # Streams SEPARATED, and this is the capture in this script where that
+        # matters most: what it returns is DATA — split into $sections and handed
+        # to "$BUILD_SCRIPT" — so a line either stage writes to stderr while the
+        # pipeline still exits 0 becomes a SECTION NAME. Not hypothetical: the
+        # mikefarah yq this repo pins answers `-j` with the right value on
+        # stdout, "Flag --tojson has been deprecated" on stderr, and exit 0
+        # (measured, v4.44.3). Measured against this script with a yq wrapper
+        # that prints one deprecation line to stderr and then succeeds, over an
+        # .agents-sync.yml declaring [python, docker] — merged, the run logged
+        # "Sections: Flag --r has been deprecated, please use --unwrapScalar
+        # python docker"; separated, "Sections: python docker". And the
+        # corruption does not stop at the log: `build-agents-md.sh Flag python
+        # docker` exits 0 and emits 45,677 bytes against 45,598 for `python
+        # docker`, with the header rewritten to "Sections: Flag python docker"
+        # plus an appended "WARNING: unknown section 'Flag'" — content this
+        # script would then see as changed, commit, and push. The brace group is
+        # what puts BOTH stages' stderr in the file; mktemp is checked because
+        # this loop counts per-repo failures rather than aborting the fleet.
+        if ! sections_err_file=$(mktemp -p "$WORK_DIR"); then
+            fail "$repo_name: could not create a temp file to capture the section read's diagnostics"
+            ((FAIL_COUNT++)) || true
+            continue
+        fi
+        sections_read_rc=0
+        repo_sections_raw=$( { base64 -d <<< "$remote_yaml" \
+                | yq -r '.sections // [] | .[]'; } 2>"$sections_err_file" ) || sections_read_rc=$?
+        # Read and removed unconditionally, before the branch: the value is only
+        # ever USED in the failure branch, but the file must go either way.
+        sections_err=$(pick_diagnostic tool "$sections_err_file")
+        rm -f "$sections_err_file"
+        if [[ $sections_read_rc -ne 0 ]]; then
+            fail "$repo_name: could not read the sections from .agents-sync.yml — ${sections_err:-no diagnostic output}"
+            ((FAIL_COUNT++)) || true
+            continue
+        fi
+
+        while IFS= read -r s; do
+            [[ -n "$s" ]] && sections+=("$s")
+        done <<< "$repo_sections_raw"
+
+        # Optional per-repo opt-in: let the sync REWRITE an existing
+        # CLAUDE.md that doesn't import @AGENTS.md (see the "CLAUDE.md
+        # bridge" block below). Anything other than exactly "true" — unset,
+        # malformed YAML, "false", "yes", etc. — normalizes to false.
+        fix_claude_md=$(echo "$remote_yaml" | base64 -d | yq -r '.fix_claude_md // false' 2>/dev/null || echo false)
+        [[ "$fix_claude_md" == "true" ]] || fix_claude_md=false
+    else
+        sections=("${DEFAULT_SECTIONS[@]}")
+        fix_claude_md=false
+    fi
+
+    log "Sections: ${sections[*]:-none}"
+
+    # ── Clone & prepare ────────────────────────────────────────────────
+    #
+    # The managed content is NOT built yet. What gets built depends on whether
+    # this repo's `.claude/` can be edited, and that is a fact about the CLONE
+    # (its .gitignore, its settings.json) — see the deliverability
+    # classification below.
+
+    repo_dir="$WORK_DIR/$(echo "$repo_name" | tr '/' '_')"
+    if ! gh repo clone "$repo_name" "$repo_dir" -- --depth 1; then
+        fail "clone failed for $repo_name"
+        ((FAIL_COUNT++)) || true
+        continue
+    fi
+    cd "$repo_dir"
+
+    # Configure git identity for commits (not inherited in fresh clones)
+    git config user.name "agents-md-sync[bot]"
+    git config user.email "$SYNC_BOT_EMAIL"
+
+    # Embed token in remote URL so git push can authenticate in CI (no TTY).
+    # gh-repo-clone sets an HTTPS remote but does not persist credentials for
+    # subsequent git operations, causing:
+    #   fatal: could not read Username for 'https://github.com': No such device or address
+    if [[ -n "${GH_TOKEN:-}" ]]; then
+        git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${repo_name}.git"
+    fi
+
+    # ── .claude/ deliverability: choose this repo's AGENTS.md mode ─────
+    #
+    # The stub in AGENTS.md points at the owner's own setup and at the
+    # contributor file, neither of which needs `.claude/`. Two facts about the
+    # CLONE still matter, because both are deliberate refusals rather than
+    # failures: `.claude/` gitignored (two fleet repos do this on purpose), and
+    # a settings.json we cannot parse (a config we cannot read is one we must
+    # not rewrite). A repo like that keeps the FULL contributor rules inline
+    # as before, gets no agent-checks guard, and keeps its retired owner-only
+    # files untouched, because removing the files while the registrations
+    # stay would leave a hook pointing at nothing.
+
+    fleet_deliver=true
+    fleet_reason=""
+    fleet_reg_state="n/a"
+
+    if git check-ignore -q "$FLEET_HOOK_REL_PATH" 2>/dev/null \
+       || git check-ignore -q "$SETTINGS_REL_PATH" 2>/dev/null; then
+        fleet_deliver=false
+        fleet_reason=".claude/ is gitignored in this repo — keeping the contributor rules inline instead"
+    else
+        fleet_reg_state=$(BOOTSTRAP_HOOK_BASENAME="skills-bootstrap.sh" \
+                          "$BOOTSTRAP_STATUS_SCRIPT" "$SETTINGS_REL_PATH")
+        if [[ "$fleet_reg_state" == "unparseable" ]]; then
+            fleet_deliver=false
+            fleet_reason="$SETTINGS_REL_PATH is not parseable JSON — refusing to edit it, keeping the contributor rules inline"
+        fi
+    fi
+
+    if $fleet_deliver; then FLEET_MODE=stub; else FLEET_MODE=full; fi
+    [[ -n "$fleet_reason" ]] && log "owner-guidance: $fleet_reason."
+
+    # ── owner-only guidance (ADR 0043): classify what to retire ────────
+    # Files first, then the exact registrations. Nothing is retired where the
+    # clone cannot be edited safely (see above).
+    retire_files=()
+    retire_regs=()      # event|command rows still registered
+    if $fleet_deliver; then
+        for retire_path in "${RETIRED_FILES[@]}"; do
+            if [[ -f "$retire_path" || -L "$retire_path" ]] && ! git check-ignore -q "$retire_path" 2>/dev/null; then
+                retire_files+=("$retire_path")
+            fi
+        done
+        for retire_row in "${RETIRED_REGISTRATIONS[@]}"; do
+            retire_state=$(BOOTSTRAP_HOOK_EVENT="${retire_row%%|*}" \
+                           BOOTSTRAP_HOOK_COMMAND="${retire_row#*|}" \
+                           "$UNREGISTER_SCRIPT" status "$SETTINGS_REL_PATH")
+            [[ "$retire_state" == "present" ]] && retire_regs+=("$retire_row")
+        done
+    fi
+    retire_up_to_date=true
+    if (( ${#retire_files[@]} > 0 || ${#retire_regs[@]} > 0 )); then retire_up_to_date=false; fi
+    log "owner-guidance: mode=$FLEET_MODE retire-files=${#retire_files[@]} retire-registrations=${#retire_regs[@]}"
+
+    # ── contributor rules: classify ────────────────────────────────────
+    contributor_state="n/a"   # n/a | missing | current | drifted
+    if [[ -s "$CONTRIBUTOR_SOURCE" ]]; then
+        contributor_state="missing"
+        # A symlink would send the write outside the repo; a file without the
+        # managed header is someone else's, and the sync must not overwrite it.
+        # Either refusal skips the whole repo on purpose, stub update included:
+        # the new stub points agents at this path, so the old stub stays until
+        # the file there is ours.
+        if [[ -L .github || -L "$CONTRIBUTOR_REL_PATH" ]]; then
+            fail "$repo_name: $CONTRIBUTOR_REL_PATH (or .github) is a symlink — refusing to write the contributor rules."
+            ((FAIL_COUNT++)) || true
+            cd "$REPO_ROOT"; continue
+        fi
+        if [[ -e "$CONTRIBUTOR_REL_PATH" ]] \
+           && { [[ ! -f "$CONTRIBUTOR_REL_PATH" ]] \
+                || ! head -n 1 "$CONTRIBUTOR_REL_PATH" | grep -qF -- "$CONTRIBUTOR_HEADER"; }; then
+            fail "$repo_name: $CONTRIBUTOR_REL_PATH exists but does not carry the managed header ($CONTRIBUTOR_HEADER) — refusing to overwrite it."
+            ((FAIL_COUNT++)) || true
+            cd "$REPO_ROOT"; continue
+        fi
+        if [[ -f "$CONTRIBUTOR_REL_PATH" ]]; then
+            cmp -s "$CONTRIBUTOR_REL_PATH" "$CONTRIBUTOR_SOURCE" \
+                && contributor_state="current" || contributor_state="drifted"
+        fi
+        log "contributor-rules: file=$contributor_state"
+    fi
+    contributor_up_to_date=true
+    if [[ "$contributor_state" == "missing" || "$contributor_state" == "drifted" ]]; then
+        contributor_up_to_date=false
+    fi
+
+    # ── Build managed content ──────────────────────────────────────────
+
+    # Checked, not bare: under set -e a failed build in a plain assignment
+    # aborted the whole fleet run at this repo, leaving every later one unsynced.
+    if ! managed_content=$(AGENTS_MD_MODE="$FLEET_MODE" "$BUILD_SCRIPT" "${sections[@]}"); then
+        fail "$repo_name: could not build AGENTS.md (mode $FLEET_MODE, sections: ${sections[*]:-none})"
+        ((FAIL_COUNT++)) || true
+        cd "$REPO_ROOT"; continue
+    fi
+
+    # ── Preserve repo-specific content ─────────────────────────────────
+
+    repo_specific=""
+    existing_prefix=""
+    if [[ -f AGENTS.md ]]; then
+        # Anchored AND exact-whole-line, on both the presence check and the
+        # extraction — not the unanchored/non-end-anchored pair this used to
+        # be. This repo's own AGENTS.md carried a live example of why: its
+        # generated BEGIN-MANAGED-SECTION header quotes the marker text
+        # verbatim (`DO NOT EDIT ABOVE "## Repo-specific additions"`), so an
+        # unanchored `grep -qF "$MARKER"` is satisfied by line 1 of a file
+        # with no real marker at all, and a start-only-anchored
+        # `/^${MARKER}/` treats a truncated `## Repo-specific additions" -->`
+        # fragment (the tail of that same header, however it got split onto
+        # its own line) as a valid anchor too. Either way the sed extracts
+        # the wrong slice — in the truncated-fragment case, everything from
+        # THAT line down, which includes a stale managed block and re-glues
+        # it below a freshly generated one on every future sync, doubling it
+        # forever. `-x` on the grep and `$` on the sed regex require the
+        # WHOLE line to equal the marker, so only a genuine
+        # `## Repo-specific additions` line — nothing quoting it, nothing
+        # truncating it — can anchor either check. This closes the
+        # unanchored-grep/anchored-sed mismatch the comment further down this
+        # block (the "glued marker" note) already flagged: that comment was
+        # about the trailing-newline case; this is the other way the same
+        # mismatch bites.
+        if grep -qxF -- "$MARKER" AGENTS.md; then
+            repo_specific=$(sed -n "/^${MARKER}\$/,\$p" AGENTS.md)
+        else
+            # Existing AGENTS.md without marker — preserve entire content above
+            # the marker heading, with managed content added below it
+            existing_prefix="$(cat AGENTS.md)"
+        fi
+    fi
+
+    if [[ -z "$repo_specific" && -z "$existing_prefix" ]]; then
+        repo_specific="$(printf '%s\n\n%s\n' \
+            "$MARKER" \
+            "<!-- Add your repo-specific agent guidance below this line -->")"
+    fi
+
+    # ── Assemble ───────────────────────────────────────────────────────
+
+    if [[ -n "$existing_prefix" ]]; then
+        # No-marker case: managed content on top, then the marker, then the
+        # existing hand-written content preserved below it — mirroring the
+        # marker-case ordering below (managed content above the marker,
+        # repo-specific content at-and-below it). This ordering is required
+        # by the parse invariant: on every sync, content above "$MARKER" is
+        # managed (overwritten) and content from "$MARKER" down is preserved.
+        # Putting the existing content ABOVE the marker here (as before) would
+        # make the *next* sync's marker-case parse treat the stale managed
+        # copy below it as "repo-specific", silently destroying everything
+        # written above on the second sync.
+        new_agents_md="$(printf '%s\n%s\n\n%s\n' "$managed_content" "$MARKER" "$existing_prefix")"
+    else
+        # The "\n" between managed content and repo_specific is load-bearing:
+        # managed_content carries no trailing newline (command substitution
+        # strips it), so without it the marker line at the top of
+        # repo_specific glues onto "<!-- END MANAGED SECTION -->". A glued
+        # marker still passes the unanchored `grep -qF` presence check above
+        # but fails the anchored `sed -n "/^${MARKER}/..."` parse on the next
+        # sync, leaving repo_specific empty and dropping all preserved content.
+        new_agents_md="$(printf '%s\n%s\n' "$managed_content" "$repo_specific")"
+    fi
+
+    # ── Codex project-doc budget ───────────────────────────────────────
+    #
+    # WARN, NEVER BLOCK. Codex (codex-cli 0.154.0, measured 2026-09-14) reads
+    # the AGENTS.md chain under a running byte budget `project_doc_max_bytes`,
+    # default 32768, and a file that does not fit is CUT at that byte — not
+    # skipped, not reported. The only trace is a `tracing::warn!("project doc
+    # exceeds remaining budget; truncating")` in
+    # `codex-rs/core/src/agents_md.rs`, which no ordinary session ever sees.
+    # Measured 2026-09-14 on example-site-platform: `codex debug prompt-input` rendered
+    # a 55,788-byte AGENTS.md (a feature-branch checkout; `main`'s copy was
+    # 71,794 bytes) as exactly 32,768 bytes, ending mid-heading at
+    # `## An unapproved gate holds its concu`.
+    #
+    # The managed half is ours and is held under budget by this repo's own
+    # size tests; the overflow is always in "## Repo-specific additions",
+    # which belongs to the repo. So this run says so and syncs anyway. Failing
+    # the repo — or skipping the push — would withhold the managed guidance
+    # over content the sync has no business editing, which is the wrong half
+    # to punish, and would leave the repo with a STALE managed block on top of
+    # the additions that were already too long.
+    #
+    # Sited after BOTH assignments above and before the up-to-date and
+    # --dry-run branches, so the warning is about the file's size rather than
+    # about this run changing it: a repo that has been over budget since long
+    # before this run is exactly the one nobody is going to notice otherwise,
+    # and it is also the one that reports "Up to date — skipping". The byte
+    # count is of what `echo "$new_agents_md" > AGENTS.md` actually writes —
+    # that `echo` adds the trailing newline command substitution stripped, so
+    # `printf '%s\n'` here counts the same bytes. `wc` reads to EOF, so the
+    # pipe has no early-exit reader and no SIGPIPE hazard (issue #81).
+    agents_md_bytes=$(printf '%s\n' "$new_agents_md" | wc -c | tr -d ' ')
+    if [[ "$agents_md_bytes" -gt "$CODEX_PROJECT_DOC_MAX_BYTES" ]]; then
+        echo "::warning::$repo_name: AGENTS.md is $agents_md_bytes bytes — over Codex's ${CODEX_PROJECT_DOC_MAX_BYTES}-byte project-doc budget (project_doc_max_bytes); Codex truncates it silently at that byte. Trim '## Repo-specific additions' (move long-form to docs/)."
+        log "AGENTS.md is $agents_md_bytes bytes — over Codex's ${CODEX_PROJECT_DOC_MAX_BYTES}-byte project-doc budget; syncing it anyway (the managed half is under budget; the additions are the repo's to trim)."
+    fi
+
+    # ── Diff check ─────────────────────────────────────────────────────
+    # Skip only when AGENTS.md is already correct AND the CLAUDE.md bridge
+    # is already in place AND there's no opted-in bridge fix pending — a
+    # repo can be AGENTS.md-current but still missing CLAUDE.md (e.g. it
+    # predates the bridge), and that case must still get a commit that adds
+    # just the bridge file. Likewise, a repo can be current-and-bridged yet
+    # opted into fixing a broken bridge (fix_claude_md: true with an
+    # existing no-import CLAUDE.md), and that case must still get a commit
+    # that rewrites it.
+
+    agents_up_to_date=false
+    if [[ -f AGENTS.md ]] && diff -q <(echo "$new_agents_md") AGENTS.md &>/dev/null; then
+        agents_up_to_date=true
+    fi
+
+    claude_md_present=false
+    [[ -f CLAUDE.md ]] && claude_md_present=true
+
+    # bridge_status classifies an existing CLAUDE.md via bridge-status.sh;
+    # needs_claude_fix gates the opt-in rewrite path below on a broken
+    # bridge AND the repo's fix_claude_md: true.
+    bridge_status="missing"
+    if $claude_md_present; then
+        bridge_status=$("$BRIDGE_SCRIPT" CLAUDE.md)
+    fi
+
+    needs_claude_fix=false
+    if $claude_md_present && [[ "$bridge_status" == "no-import" ]] && [[ "$fix_claude_md" == "true" ]]; then
+        needs_claude_fix=true
+    fi
+
+    # ── skills-bootstrap: classify ─────────────────────────────────────
+    # Both keys are read from the CLONE, so neither can be spoofed by config
+    # in this repo: the allowlist is ours, the lock is theirs. Everything
+    # below stays false for a repo that is not allowlisted, which is why this
+    # block cannot change behaviour for the 16 repos that aren't.
+
+    bootstrap_deliver=false     # this repo should end up with hook + registration
+    bootstrap_reason=""         # why not, when it shouldn't
+    hook_state="n/a"            # missing | current | drifted
+    reg_state="n/a"             # registered | no-entry | unparseable | missing
+    lock_present=false
+    [[ -f "$LOCK_REL_PATH" ]] && lock_present=true
+
+    if bootstrap_allowlisted "$repo_name"; then
+        if ! $lock_present; then
+            # NOT a half-install: the hook without a lock prints a permanent
+            # "skills: DEGRADED — no skills.lock found" verdict into every
+            # ephemeral session, naming a generator script the repo does not
+            # have. Withholding is the correct, documented outcome.
+            bootstrap_reason="no skills.lock in the repo yet — delivery withheld (the repo declares its own bundles; the sync never writes one)"
+        elif [[ -z "$BOOTSTRAP_BLOB" ]]; then
+            bootstrap_reason="pinned hook unavailable this run"
+        else
+            bootstrap_deliver=true
+
+            if [[ -f "$HOOK_REL_PATH" ]]; then
+                if cmp -s "$HOOK_REL_PATH" "$BOOTSTRAP_BLOB"; then
+                    hook_state="current"
+                else
+                    hook_state="drifted"
+                fi
+            else
+                hook_state="missing"
+            fi
+
+            reg_state=$("$BOOTSTRAP_STATUS_SCRIPT" "$SETTINGS_REL_PATH")
+
+            # An unreadable settings.json is never rewritten (same posture as
+            # an existing CLAUDE.md). Delivering the hook file alone would
+            # leave it silently dead, so withhold the whole artifact and say so.
+            if [[ "$reg_state" == "unparseable" ]]; then
+                bootstrap_deliver=false
+                bootstrap_reason="$SETTINGS_REL_PATH is not parseable JSON — refusing to edit it"
+            fi
+        fi
+    fi
+
+    bootstrap_up_to_date=true
+    if $bootstrap_deliver && { [[ "$hook_state" != "current" ]] || [[ "$reg_state" != "registered" ]]; }; then
+        bootstrap_up_to_date=false
+    fi
+
+    if [[ -n "$bootstrap_reason" ]]; then
+        log "skills-bootstrap: $bootstrap_reason."
+    fi
+
+    # ── .gitattributes: classify ───────────────────────────────────────
+    # Every synced repo, whatever its AGENTS.md mode: the line costs one
+    # entry, matches nothing in a repo with no hook scripts, and keeps any hook
+    # a repo does carry parseable by bash from a Windows-autocrlf clone. Two
+    # refusals, neither a failure: a .gitattributes that is itself gitignored
+    # (`git add` would exit 1 and, under `set -e`, end the whole fleet run) and
+    # one that is not a regular file (the helper will not edit a symlink).
+    gitattr_deliver=true
+    gitattr_state=$("$GITATTR_SCRIPT" status "$GITATTR_REL_PATH")
+    if git check-ignore -q "$GITATTR_REL_PATH" 2>/dev/null; then
+        gitattr_deliver=false
+        log "WARN: $GITATTR_REL_PATH is gitignored in $repo_name — the hook-script LF line is not delivered."
+    elif [[ -L "$GITATTR_REL_PATH" || ( -e "$GITATTR_REL_PATH" && ! -f "$GITATTR_REL_PATH" ) ]]; then
+        gitattr_deliver=false
+        log "WARN: $GITATTR_REL_PATH is not a regular file in $repo_name — refusing to edit it; the hook-script LF line is not delivered."
+    fi
+    gitattr_up_to_date=true
+    if $gitattr_deliver && [[ "$gitattr_state" != "present" ]]; then
+        gitattr_up_to_date=false
+    fi
+    linguist_missing=()
+    if $gitattr_deliver; then
+        for linguist_line in "${LINGUIST_LINES[@]}"; do
+            [[ "$(HOOK_EOL_LINE="$linguist_line" HOOK_EOL_COMMENT="$LINGUIST_COMMENT" \
+                  "$GITATTR_SCRIPT" status "$GITATTR_REL_PATH")" == "present" ]] \
+                || linguist_missing+=("$linguist_line")
+        done
+    fi
+    [[ ${#linguist_missing[@]} -gt 0 ]] && gitattr_up_to_date=false
+
+    # ── Dependabot auto-merge workflow: classify ───────────────────────
+    # missing | current | drifted | skipped | n/a. Managed: missing and
+    # drifted are written. Never written (skipped, with a log line saying why):
+    #   - example-site-platform itself (it has its own self- workflow);
+    #   - a repo where ANY .github/workflows/*.y*ml calls example-site-platform's
+    #     reusable dependabot workflow, matched case-insensitively
+    #     (example-site-a, example-site-b);
+    #   - a symlinked .github, .github/workflows or workflow path, or a
+    #     non-regular file at it (WARN, no write);
+    #   - a repo with self-dependabot-auto-merge.yml;
+    #   - a repo with only the .yaml spelling (a .yml would be a second
+    #     workflow), and a gitignored path.
+    automerge_state="n/a"
+    # Shared by the auto-merge and dependabot.yml lanes.
+    automerge_cms_call_re='uses:[[:space:]]*["'\'']?dummy-gha/example-site-platform/\.github/workflows/dependabot-'
+    # Any workflow file may hold the caller, and the owner's case varies.
+    automerge_cms_caller=false
+    if [[ -d .github/workflows && ! -L .github/workflows && ! -L .github ]]; then
+        for automerge_wf_file in .github/workflows/*.yml .github/workflows/*.yaml; do
+            [[ -f "$automerge_wf_file" && ! -L "$automerge_wf_file" ]] || continue
+            if grep -Eqi "$automerge_cms_call_re" "$automerge_wf_file"; then
+                automerge_cms_caller=true
+                break
+            fi
+        done
+    fi
+    if $AUTOMERGE_ENABLED; then
+        automerge_state="missing"
+        if [[ "${repo_name##*/}" == "example-site-platform" ]]; then
+            automerge_state="skipped"
+            log "dependabot auto-merge: $repo_name is example-site-platform itself, which has its own workflow — not delivered."
+        elif [[ -e .github/workflows/self-dependabot-auto-merge.yml ]]; then
+            automerge_state="skipped"
+            log "dependabot auto-merge: $repo_name has self-dependabot-auto-merge.yml — not delivered."
+        elif $automerge_cms_caller; then
+            automerge_state="skipped"
+            log "dependabot auto-merge: $repo_name calls example-site-platform's reusable workflow — not delivered."
+        elif [[ -e .github/workflows/dependabot-auto-merge.yaml && ! -e "$AUTOMERGE_WF_REL_PATH" ]]; then
+            automerge_state="skipped"
+            log "WARN: $repo_name has .github/workflows/dependabot-auto-merge.yaml; writing the .yml spelling would make a second workflow — not delivered. Rename it to .yml to have it managed."
+        elif [[ -L .github || -L .github/workflows || -L "$AUTOMERGE_WF_REL_PATH" \
+                || ( -e "$AUTOMERGE_WF_REL_PATH" && ! -f "$AUTOMERGE_WF_REL_PATH" ) ]]; then
+            # A symlink would send the write outside the repo (or, dangling,
+            # make `cp` fail and abort the whole fleet run under set -e).
+            automerge_state="skipped"
+            log "WARN: $AUTOMERGE_WF_REL_PATH (or .github, .github/workflows) is a symlink or not a regular file in $repo_name — refusing to write it; the workflow is not delivered."
+        elif git check-ignore -q "$AUTOMERGE_WF_REL_PATH" 2>/dev/null; then
+            automerge_state="skipped"
+            log "WARN: $AUTOMERGE_WF_REL_PATH is gitignored in $repo_name — not delivered."
+        elif [[ -f "$AUTOMERGE_WF_REL_PATH" ]]; then
+            cmp -s "$AUTOMERGE_TEMPLATE_DIR/dependabot-auto-merge.yml" "$AUTOMERGE_WF_REL_PATH" \
+                && automerge_state="current" || automerge_state="drifted"
+        fi
+    fi
+    # The lockfile half. automerge_lock_state: n/a (no lockfile, or the lane
+    # is skipped), ok (consistent already), fix (the entry or a dependency
+    # needs editing), refused (a symlink, a non-regular file, a gitignored
+    # path or a shape the helper does not recognize: WARN, no edit).
+    # A workflow that is already current but whose lockfile needs the fix
+    # becomes state "lockfile": only the lockfile is written.
+    automerge_lock_state="n/a"
+    if [[ "$automerge_state" != "skipped" && "$automerge_state" != "n/a" \
+            && ( -e "$ACTIONS_LOCK_REL_PATH" || -L "$ACTIONS_LOCK_REL_PATH" ) ]]; then
+        if [[ -L .github || -L .github/workflows || -L "$ACTIONS_LOCK_REL_PATH" || ! -f "$ACTIONS_LOCK_REL_PATH" ]]; then
+            automerge_lock_state="refused"
+            log "WARN: $ACTIONS_LOCK_REL_PATH (or .github, .github/workflows) is a symlink or not a regular file in $repo_name — refusing to edit it; the lockfile is left as it is."
+        elif git check-ignore -q "$ACTIONS_LOCK_REL_PATH" 2>/dev/null; then
+            automerge_lock_state="refused"
+            log "WARN: $ACTIONS_LOCK_REL_PATH is gitignored in $repo_name — not edited."
+        else
+            automerge_lock_rc=0
+            "$ACTIONS_LOCK_SCRIPT" check "$ACTIONS_LOCK_REL_PATH" "$AUTOMERGE_WF_REL_PATH" 2>/dev/null || automerge_lock_rc=$?
+            case "$automerge_lock_rc" in
+                0)  automerge_lock_state="ok" ;;
+                10) automerge_lock_state="fix" ;;
+                *)  automerge_lock_state="refused"
+                    log "WARN: $ACTIONS_LOCK_REL_PATH in $repo_name has a shape the sync does not recognize — not edited; run gh actions-lock there." ;;
+            esac
+        fi
+        # A repo with a lockfile gets the workflow only together with a lock
+        # edit that will work: a workflow with no valid entry is the exact
+        # state `gh actions-lock --no-fix` rejects. Refused means no write.
+        if [[ "$automerge_lock_state" == "refused" ]]; then
+            automerge_state="skipped"
+            log "WARN: $repo_name has $ACTIONS_LOCK_REL_PATH but the sync cannot edit it, so $AUTOMERGE_WF_REL_PATH is not delivered either (a workflow with no lock entry fails gh actions-lock --no-fix)."
+        fi
+        [[ "$automerge_state" == "current" && "$automerge_lock_state" == "fix" ]] && automerge_state="lockfile"
+    fi
+    automerge_up_to_date=true
+    [[ "$automerge_state" == "missing" || "$automerge_state" == "drifted" || "$automerge_state" == "lockfile" ]] && automerge_up_to_date=false
+
+    # ── Dependabot config: classify ────────────────────────────────────
+    # missing | current | drifted | skipped | n/a. Written (missing, drifted)
+    # only when the repo's own file is absent, equals the template, starts with
+    # the managed header, or lists nothing but github-actions (ADR 0047). Any
+    # other ecosystem means the repo hand-maintains its file. Never written:
+    # example-site-platform itself or a caller of its reusable workflows, a repo with no
+    # dated-phrasing manifest (Dependabot errors on a directory with none),
+    # and a symlinked, non-regular, gitignored or .yaml-spelled file.
+    depcfg_state="n/a"
+    if $DEPCFG_ENABLED; then
+        depcfg_state="skipped"
+        depcfg_other=""
+        if [[ -f "$DEPCFG_REL_PATH" && ! -L "$DEPCFG_REL_PATH" ]]; then
+            depcfg_other=$(yq '((.updates // []) | length) as $n | ([.updates[]? | select(.["package-ecosystem"] != "github-actions")] | length) as $o | ($n == 0 or $o > 0)' "$DEPCFG_REL_PATH" 2>/dev/null) || depcfg_other="unparseable"
+        fi
+        if [[ "${repo_name##*/}" == "example-site-platform" ]] || $automerge_cms_caller; then
+            log "dependabot config: $repo_name is example-site-platform or calls its reusable workflows — not delivered."
+        elif [[ -L .github || -L "$DEPCFG_REL_PATH" || ( -e "$DEPCFG_REL_PATH" && ! -f "$DEPCFG_REL_PATH" ) ]]; then
+            log "WARN: $DEPCFG_REL_PATH (or .github) is a symlink or not a regular file in $repo_name — dependabot config not delivered."
+        elif [[ -e .github/dependabot.yaml && ! -e "$DEPCFG_REL_PATH" ]]; then
+            log "WARN: $repo_name has .github/dependabot.yaml; writing the .yml spelling would make a second config — not delivered."
+        elif [[ ! -f "$DEPCFG_MANIFEST_REL_PATH" ]]; then
+            log "dependabot config: $repo_name has no $DEPCFG_MANIFEST_REL_PATH (Dependabot errors on a directory with no manifest) — not delivered."
+        elif git check-ignore -q "$DEPCFG_REL_PATH" 2>/dev/null; then
+            log "WARN: $DEPCFG_REL_PATH is gitignored in $repo_name — not delivered."
+        elif [[ ! -f "$DEPCFG_REL_PATH" ]]; then
+            depcfg_state="missing"
+        elif cmp -s "$DEPCFG_TEMPLATE" "$DEPCFG_REL_PATH"; then
+            depcfg_state="current"
+        elif [[ "$(head -n 1 "$DEPCFG_REL_PATH")" == "$DEPCFG_HEADER"* ]]; then
+            depcfg_state="drifted"
+        elif [[ "$depcfg_other" == "false" ]]; then
+            depcfg_state="drifted"
+        else
+            log "dependabot config: $repo_name lists an ecosystem other than github-actions (or does not parse) — hand-maintained, not delivered."
+        fi
+    fi
+    depcfg_up_to_date=true
+    [[ "$depcfg_state" == "missing" || "$depcfg_state" == "drifted" ]] && depcfg_up_to_date=false
+
+    # ── agent-checks: classify ─────────────────────────────────────────
+    # Four parts, each skipped on its own rather than failing the repo:
+    #   runner    missing | current | drifted | skipped (gitignored)
+    #   dated     the runner's dated-phrasing files (AC_DATED_FILES), as one:
+    #             missing | current | drifted | skipped (gitignored, or the
+    #             runner is)
+    #   workflow  missing | present | skipped (actions.lock, platform.lock, gitignored)
+    #             "present" is ANY workflow that runs .githooks/agent-checks:
+    #             acsi-agentskills runs it as a job in ci.yml.
+    #   guard     the PreToolUse hook; delivered only where `.claude/` can be
+    #             edited (same .claude/ and settings.json refusals).
+    #   eol       the `.githooks/* text eol=lf` line in .gitattributes.
+    #   trigger   an existing agent-checks.yml's pull_request types:
+    #             current | missing-edited | skipped (a shape not edited) | n/a
+    #   secret    the PRIVACY_DENYLIST line in that workflow's runner step env:
+    #             current | missing-secret | skipped (a shape not edited) | n/a
+    ac_runner_state="n/a"; ac_dated_state="n/a"; ac_wf_state="n/a"; ac_guard_state="n/a"
+    ac_reg_state="n/a"; ac_eol_state="n/a"; ac_guard_deliver=false
+    ac_trigger_state="n/a"; ac_secret_state="n/a"
+    if $AGENT_CHECKS_ENABLED; then
+        if git check-ignore -q "$AC_RUNNER_REL_PATH" 2>/dev/null; then
+            ac_runner_state="skipped"
+            log "WARN: $AC_RUNNER_REL_PATH is gitignored in $repo_name — the agent-checks runner is not delivered."
+        elif [[ -f "$AC_RUNNER_REL_PATH" ]]; then
+            cmp -s "$AC_RUNNER_REL_PATH" "$AGENT_CHECKS_TEMPLATE_DIR/agent-checks" \
+                && ac_runner_state="current" || ac_runner_state="drifted"
+        else
+            ac_runner_state="missing"
+        fi
+
+        if [[ "$ac_runner_state" == "skipped" ]]; then
+            ac_dated_state="skipped"
+        else
+            ac_dated_state="current"
+            ac_dated_absent=0
+            for ac_dated_file in "${AC_DATED_FILES[@]}"; do
+                if git check-ignore -q ".githooks/$ac_dated_file" 2>/dev/null; then
+                    ac_dated_state="skipped"
+                    log "WARN: .githooks/$ac_dated_file is gitignored in $repo_name — the dated-phrasing warning pass is not delivered."
+                    break
+                elif [[ ! -f ".githooks/$ac_dated_file" ]]; then
+                    ac_dated_absent=$((ac_dated_absent + 1))
+                    ac_dated_state="drifted"
+                elif ! cmp -s ".githooks/$ac_dated_file" "$AGENT_CHECKS_TEMPLATE_DIR/$ac_dated_file"; then
+                    ac_dated_state="drifted"
+                fi
+            done
+            [[ "$ac_dated_state" == "drifted" && $ac_dated_absent -eq ${#AC_DATED_FILES[@]} ]] \
+                && ac_dated_state="missing"
+        fi
+
+        ac_wf_state="missing"
+        if grep -lqsF "$AC_RUNNER_REL_PATH" .github/workflows/*.yml .github/workflows/*.yaml 2>/dev/null; then
+            ac_wf_state="present"
+        elif [[ "$ac_runner_state" == "skipped" ]]; then
+            ac_wf_state="skipped"
+        elif [[ -e .github/workflows/actions.lock ]]; then
+            ac_wf_state="skipped"
+            log "WARN: $repo_name locks its actions in .github/workflows/actions.lock — the agent-checks workflow is not delivered (its uses: lines must be tags locked by gh actions-lock, which the sync cannot run). Add it by hand."
+        elif [[ -e platform.lock ]]; then
+            ac_wf_state="skipped"
+            log "agent-checks: $repo_name is a example-site-platform consumer (platform.lock) — the workflow is not delivered; its platform-pin-consistency check rejects any workflow the platform does not dictate. The platform carries it instead."
+        elif git check-ignore -q "$AC_WF_REL_PATH" 2>/dev/null; then
+            ac_wf_state="skipped"
+            log "WARN: $AC_WF_REL_PATH is gitignored in $repo_name — not delivered."
+        fi
+
+        if $fleet_deliver && ! git check-ignore -q "$AC_GUARD_REL_PATH" 2>/dev/null; then
+            ac_guard_deliver=true
+            ac_guard_state="missing"
+            if [[ -f "$AC_GUARD_REL_PATH" ]]; then
+                cmp -s "$AC_GUARD_REL_PATH" "$AGENT_CHECKS_TEMPLATE_DIR/agent-checks-guard.sh" \
+                    && ac_guard_state="current" || ac_guard_state="drifted"
+            fi
+            ac_reg_state=$(BOOTSTRAP_HOOK_EVENT="PreToolUse" \
+                           BOOTSTRAP_HOOK_BASENAME="agent-checks-guard.sh" \
+                           BOOTSTRAP_HOOK_MATCHER="$AC_GUARD_MATCHER" \
+                           "$BOOTSTRAP_STATUS_SCRIPT" "$SETTINGS_REL_PATH")
+        fi
+
+        if $gitattr_deliver && [[ "$ac_runner_state" != "skipped" ]]; then
+            ac_eol_state=$(HOOK_EOL_LINE="$AC_EOL_LINE" HOOK_EOL_COMMENT="$AC_EOL_COMMENT" \
+                           "$GITATTR_SCRIPT" status "$GITATTR_REL_PATH")
+        fi
+
+        # The delivered workflow's pull_request trigger must list `edited`
+        # (see ac_trigger_status). Only that file, and only where it runs the
+        # runner; a repo running it from another workflow is left alone.
+        if [[ -f "$AC_WF_REL_PATH" ]] && grep -qF "$AC_RUNNER_REL_PATH" "$AC_WF_REL_PATH" \
+           && ! git check-ignore -q "$AC_WF_REL_PATH" 2>/dev/null; then
+            ac_trigger_state=$(ac_trigger_status "$AC_WF_REL_PATH")
+            if [[ "$ac_trigger_state" == skipped:* ]]; then
+                log "WARN: $repo_name's $AC_WF_REL_PATH is not patched to re-run on a description edit (${ac_trigger_state#skipped: }) — add edited to its pull_request types by hand."
+                ac_trigger_state="skipped"
+            fi
+            # The same file's runner step must pass the PRIVACY_DENYLIST secret
+            # (see ac_secret_status), or the CI privacy scan cannot read it.
+            ac_secret_state=$(ac_secret_status "$AC_WF_REL_PATH")
+            if [[ "$ac_secret_state" == skipped:* ]]; then
+                log "WARN: $repo_name's $AC_WF_REL_PATH is not patched to pass the privacy denylist secret (${ac_secret_state#skipped: }) — add $AC_SECRET_LINE to the env of the step that runs the runner by hand."
+                ac_secret_state="skipped"
+            fi
+        fi
+        log "agent-checks: runner=$ac_runner_state dated=$ac_dated_state workflow=$ac_wf_state trigger=$ac_trigger_state guard=$ac_guard_state settings=$ac_reg_state eol=$ac_eol_state secret=$ac_secret_state"
+    fi
+    ac_up_to_date=true
+    if [[ "$ac_runner_state" == "missing" || "$ac_runner_state" == "drifted" \
+          || "$ac_dated_state" == "missing" || "$ac_dated_state" == "drifted" \
+          || "$ac_wf_state" == "missing" || "$ac_eol_state" == "missing" \
+          || "$ac_trigger_state" == "missing-edited" || "$ac_secret_state" == "missing-secret" ]]; then
+        ac_up_to_date=false
+    fi
+    if $ac_guard_deliver && { [[ "$ac_guard_state" != "current" ]] || [[ "$ac_reg_state" != "registered" ]]; }; then
+        ac_up_to_date=false
+    fi
+
+    # ── privacy-comment-alert: classify ────────────────────────────────
+    #   scan      missing | current | drifted | skipped (gitignored)
+    #   workflow  missing | present | skipped (actions.lock, platform.lock, gitignored)
+    pca_scan_state="n/a"; pca_wf_state="n/a"
+    if $PCA_ENABLED; then
+        if git check-ignore -q "$PCA_SCAN_REL_PATH" 2>/dev/null; then
+            pca_scan_state="skipped"
+            log "WARN: $PCA_SCAN_REL_PATH is gitignored in $repo_name — the privacy-comment-alert scan script is not delivered."
+        elif [[ ! -f "$PCA_SCAN_REL_PATH" ]]; then
+            pca_scan_state="missing"
+        elif cmp -s "$PCA_SCAN_REL_PATH" "$PCA_TEMPLATE_DIR/privacy-comment-scan.py"; then
+            pca_scan_state="current"
+        else
+            pca_scan_state="drifted"
+        fi
+        if [[ -e "$PCA_WF_REL_PATH" ]]; then
+            pca_wf_state="present"
+        elif [[ "$pca_scan_state" == "skipped" ]]; then
+            pca_wf_state="skipped"
+        elif [[ -e .github/workflows/actions.lock ]]; then
+            pca_wf_state="skipped"
+            log "WARN: $repo_name locks its actions in .github/workflows/actions.lock — the privacy-comment-alert workflow is not delivered (its uses: lines must be tags locked by gh actions-lock, which the sync cannot run). Add it by hand."
+        elif [[ -e platform.lock ]]; then
+            pca_wf_state="skipped"
+            log "privacy-comment-alert: $repo_name is a example-site-platform consumer (platform.lock) — the workflow is not delivered; its platform-pin-consistency check rejects any workflow the platform does not dictate. The platform carries it instead (example-site-platform v0.1.193+, seeded by its next platform bump)."
+        elif git check-ignore -q "$PCA_WF_REL_PATH" 2>/dev/null; then
+            pca_wf_state="skipped"
+            log "WARN: $PCA_WF_REL_PATH is gitignored in $repo_name — not delivered."
+        else
+            pca_wf_state="missing"
+        fi
+        log "privacy-comment-alert: scan=$pca_scan_state workflow=$pca_wf_state"
+    fi
+    pca_up_to_date=true
+    if [[ "$pca_scan_state" == "missing" || "$pca_scan_state" == "drifted" || "$pca_wf_state" == "missing" ]]; then
+        pca_up_to_date=false
+    fi
+
+    # ── skill shell execution: state ───────────────────────────────────
+    # A repo whose .claude/ is gitignored, or whose settings.json is not
+    # parseable, is a refusal, not a failure (same as the hooks above).
+    skillshell_state="n/a"          # n/a | already-set | unset
+    if git check-ignore -q "$SETTINGS_REL_PATH" 2>/dev/null; then
+        log "WARN: $SETTINGS_REL_PATH is gitignored in $repo_name — disableSkillShellExecution not delivered."
+    elif skillshell_state=$("$SKILL_SHELL_SCRIPT" status "$SETTINGS_REL_PATH"); then
+        :
+    else
+        log "WARN: $SETTINGS_REL_PATH is not parseable JSON — refusing to set disableSkillShellExecution."
+        skillshell_state="n/a"
+    fi
+    skillshell_up_to_date=true
+    [[ "$skillshell_state" == "unset" ]] && skillshell_up_to_date=false
+
+    if $agents_up_to_date && $claude_md_present && ! $needs_claude_fix && $bootstrap_up_to_date && $retire_up_to_date && $contributor_up_to_date && $gitattr_up_to_date && $automerge_up_to_date && $depcfg_up_to_date && $ac_up_to_date && $pca_up_to_date && $skillshell_up_to_date; then
+        log "Up to date — skipping."
+        ((SKIP_COUNT++)) || true
+        cd "$REPO_ROOT"
+        continue
+    fi
+
+    # ── Resolve default branch ─────────────────────────────────────────
+    # Resolved before delivery (the direct push targets it, the PR fallback
+    # bases onto it) and before the dry-run report so it can name the branch.
+    # Guarded assignment — a bare command substitution would abort the entire
+    # run under set -e on a transient API error, breaking the per-repo fail
+    # isolation used by the other steps. The -z check also catches an
+    # empty-but-exit-0 response.
+    if ! default_branch=$(gh repo view "$repo_name" --json defaultBranchRef \
+        --jq .defaultBranchRef.name) || [[ -z "$default_branch" ]]; then
+        fail "could not resolve default branch for $repo_name"
+        ((FAIL_COUNT++)) || true
+        cd "$REPO_ROOT"; continue
+    fi
+
+    # How every write below is delivered, said once and reused by each lane's
+    # dry-run line: the real run logs what happened after the push step.
+    delivery_note="(direct push to $default_branch; PR fallback if rejected)"
+
+    if $DRY_RUN; then
+        if ! $agents_up_to_date; then
+            log "[DRY RUN] Would update AGENTS.md $delivery_note"
+        elif $needs_claude_fix; then
+            log "[DRY RUN] AGENTS.md up to date; would rewrite CLAUDE.md to the standard @AGENTS.md bridge (fix_claude_md: true) $delivery_note"
+        elif ! $claude_md_present; then
+            log "[DRY RUN] AGENTS.md up to date; would add missing CLAUDE.md bridge $delivery_note"
+        fi
+
+        # The bootstrap artifact is reported line-by-line and separately from
+        # AGENTS.md, including the case where the ONLY change is the hook —
+        # a dry run that hid that would be lying about the run it previews.
+        if ! $bootstrap_up_to_date; then
+            case "$hook_state" in
+                missing) log "[DRY RUN] Would add $HOOK_REL_PATH (from $BOOTSTRAP_REGISTRY@${BOOTSTRAP_REF:0:7}) $delivery_note" ;;
+                drifted) log "[DRY RUN] Would overwrite drifted $HOOK_REL_PATH with the pinned copy (${BOOTSTRAP_REF:0:7}) $delivery_note" ;;
+            esac
+            if [[ "$reg_state" == "stale-matcher" ]]; then
+                log "[DRY RUN] Would widen the hook's legacy SessionStart matcher in $SETTINGS_REL_PATH to include fork (nothing else changed) $delivery_note"
+            elif [[ "$reg_state" != "registered" ]]; then
+                log "[DRY RUN] Would append a SessionStart entry for the hook to $SETTINGS_REL_PATH (existing entries preserved) $delivery_note"
+            fi
+        fi
+        if $bootstrap_deliver; then
+            log "[DRY RUN] Would NOT touch $LOCK_REL_PATH (present; the sync never writes it)"
+        fi
+
+        # The owner-only guidance (ADR 0043) is retired, reported line by line
+        # like every other write: a preview that hid a deletion would be lying.
+        if ! $retire_up_to_date; then
+            for retire_path in "${retire_files[@]}"; do
+                log "[DRY RUN] Would remove $retire_path (the owner-only guidance no longer ships in consumer repos) $delivery_note"
+            done
+            for retire_row in "${retire_regs[@]}"; do
+                log "[DRY RUN] Would remove the ${retire_row%%|*} entry the sync registered for ${retire_row#*|} from $SETTINGS_REL_PATH (every other entry preserved) $delivery_note"
+            done
+        fi
+        if [[ "$FLEET_MODE" == "full" ]]; then
+            log "[DRY RUN] Would keep the contributor rules inline in AGENTS.md ($SETTINGS_REL_PATH cannot be edited here)"
+        fi
+
+        if ! $contributor_up_to_date; then
+            case "$contributor_state" in
+                missing) log "[DRY RUN] Would add $CONTRIBUTOR_REL_PATH (the contributor rules, $(wc -c < "$CONTRIBUTOR_SOURCE" | tr -d ' ') bytes) $delivery_note" ;;
+                drifted) log "[DRY RUN] Would refresh drifted $CONTRIBUTOR_REL_PATH $delivery_note" ;;
+            esac
+        fi
+
+        if ! $gitattr_up_to_date && [[ "$gitattr_state" != "present" ]]; then
+            if [[ -e "$GITATTR_REL_PATH" ]]; then
+                log "[DRY RUN] Would append the hook-script LF line to $GITATTR_REL_PATH (existing lines preserved) $delivery_note"
+            else
+                log "[DRY RUN] Would add $GITATTR_REL_PATH pinning .claude/hooks/*.sh to LF $delivery_note"
+            fi
+        fi
+        for linguist_line in ${linguist_missing[@]+"${linguist_missing[@]}"}; do
+            log "[DRY RUN] Would append \`$linguist_line\` to $GITATTR_REL_PATH (existing lines preserved) $delivery_note"
+        done
+
+        if ! $automerge_up_to_date; then
+            if [[ "$automerge_state" != "lockfile" ]]; then
+                log "[DRY RUN] Would write $AUTOMERGE_WF_REL_PATH (Dependabot auto-merge sweep, $automerge_state) $delivery_note"
+            fi
+            if [[ "$automerge_lock_state" == "fix" ]]; then
+                log "[DRY RUN] Would edit $ACTIONS_LOCK_REL_PATH to list $AUTOMERGE_WF_REL_PATH with no actions and drop dependencies no workflow uses $delivery_note"
+            fi
+        fi
+
+        if ! $depcfg_up_to_date; then
+            log "[DRY RUN] Would write $DEPCFG_REL_PATH (managed Dependabot config, $depcfg_state) $delivery_note"
+        fi
+
+        if ! $pca_up_to_date; then
+            [[ "$pca_scan_state" == "missing" || "$pca_scan_state" == "drifted" ]] \
+                && log "[DRY RUN] Would write $PCA_SCAN_REL_PATH (privacy-comment-alert scan $pca_scan_state) $delivery_note"
+            [[ "$pca_wf_state" == "missing" ]] \
+                && log "[DRY RUN] Would add $PCA_WF_REL_PATH (the privacy-comment-alert workflow) $delivery_note"
+        fi
+
+        if ! $ac_up_to_date; then
+            [[ "$ac_runner_state" == "missing" || "$ac_runner_state" == "drifted" ]] \
+                && log "[DRY RUN] Would write $AC_RUNNER_REL_PATH (runner $ac_runner_state) $delivery_note"
+            [[ "$ac_dated_state" == "missing" || "$ac_dated_state" == "drifted" ]] \
+                && log "[DRY RUN] Would write .githooks/dated-phrasing.js, its allowlist and package files, and privacy-denylist.py (dated-phrasing $ac_dated_state) $delivery_note"
+            [[ "$ac_wf_state" == "missing" ]] \
+                && log "[DRY RUN] Would add $AC_WF_REL_PATH (the agent-checks CI check) $delivery_note"
+            [[ "$ac_trigger_state" == "missing-edited" ]] \
+                && log "[DRY RUN] Would add edited to the pull_request types in $AC_WF_REL_PATH (a description edit must re-run the pr-tldr check) $delivery_note"
+            [[ "$ac_secret_state" == "missing-secret" ]] \
+                && log "[DRY RUN] Would add $AC_SECRET_LINE to the env of the runner step in $AC_WF_REL_PATH (the CI privacy scan reads that secret) $delivery_note"
+            [[ "$ac_eol_state" == "missing" ]] \
+                && log "[DRY RUN] Would append the agent-checks LF line to $GITATTR_REL_PATH $delivery_note"
+            if $ac_guard_deliver; then
+                [[ "$ac_guard_state" != "current" ]] \
+                    && log "[DRY RUN] Would write $AC_GUARD_REL_PATH (guard $ac_guard_state) $delivery_note"
+                [[ "$ac_reg_state" != "registered" ]] \
+                    && log "[DRY RUN] Would register the agent-checks guard on PreToolUse in $SETTINGS_REL_PATH (currently: $ac_reg_state) $delivery_note"
+            fi
+        fi
+
+        if ! $skillshell_up_to_date; then
+            log "[DRY RUN] Would set disableSkillShellExecution: true in $SETTINGS_REL_PATH (existing keys preserved) $delivery_note"
+        fi
+
+        ((SKIP_COUNT++)) || true
+        cd "$REPO_ROOT"
+        continue
+    fi
+
+    # ── Commit on the default branch ───────────────────────────────────
+    # No side branch: the clone is already checked out on the default
+    # branch, and the sync App's ruleset bypass lets us push straight to it.
+
+    echo "$new_agents_md" > AGENTS.md
+
+    # ── CLAUDE.md bridge ────────────────────────────────────────────────
+    # Claude Code 2.1.277+ reads AGENTS.md when CLAUDE.md is absent. The fleet
+    # retains a CLAUDE.md containing `@AGENTS.md` for older CLIs pending the
+    # owner decision in https://github.com/Adam-S-Daniel/_agent-guidance/issues/172.
+    # Default remains never-rewrite: an
+    # existing CLAUDE.md is left untouched even if it doesn't import
+    # AGENTS.md, since we must not clobber someone's hand-written file.
+    # fix_claude_md is the per-repo opt-in that lifts that default — it's
+    # safe because it only fires on the repo's explicit fix_claude_md: true
+    # opt-in (the same delivery path as any other change: direct push, PR
+    # fallback). Bridge presence is judged with bridge-status.sh instead of
+    # the old `grep -qF '@AGENTS.md'`, which a fenced example could fool into
+    # a false positive; the classifier is fence-aware and isn't.
+    claude_md_added=false
+    claude_md_fixed=false
+    warn_no_import=false
+    if ! $claude_md_present; then
+        write_bridge_claude_md
+        claude_md_added=true
+    elif [[ "$bridge_status" == "no-import" ]]; then
+        if $needs_claude_fix; then
+            write_bridge_claude_md
+            claude_md_fixed=true
+            log "Rewriting CLAUDE.md to the standard @AGENTS.md bridge (fix_claude_md: true)."
+        else
+            warn_no_import=true
+            log "WARN: CLAUDE.md exists but does not import @AGENTS.md — Claude Code will not see the managed guidance."
+        fi
+    fi
+
+    # ── skills-bootstrap: deliver ──────────────────────────────────────
+    # Three files are in play and they are NOT symmetrical:
+    #   .claude/hooks/skills-bootstrap.sh — machinery. Written when absent,
+    #     OVERWRITTEN when drifted. There is no repo-specific seam in it and
+    #     no marker to preserve; a divergent copy is either stale-from-an-
+    #     older-pin (which must self-heal) or hand-edited — and a hand-edited
+    #     copy of a file that fetches and installs instruction text with no
+    #     approval prompt is precisely the thing not to preserve. Hence no
+    #     fix_* opt-in, unlike CLAUDE.md: the escape hatch is the allowlist.
+    #   .claude/settings.json — configuration. APPENDED to, never overwritten,
+    #     and refused outright if unparseable (classified above).
+    #   skills.lock — the repo's own DECLARATION. Never written, not even
+    #     created. There is deliberately no code path here that writes it.
+    bootstrap_hook_written=false
+    bootstrap_registered_now=false   # registered OR migrated: settings.json changed
+    matcher_migrated=false           # a legacy startup|resume matcher was widened
+    bootstrap_gitignored=false
+
+    if $bootstrap_deliver; then
+        # git add on a gitignored path exits 1, and under `set -euo pipefail`
+        # that aborts the ENTIRE fleet run at whichever repo hits it first —
+        # not just this repo. Two repos in the fleet gitignore `.claude/`
+        # today, deliberately and with a comment, so this probe is load-
+        # bearing. `git add -f` is not the answer: overriding a repo's
+        # explicit policy from a central sync is a conversation, not a flag.
+        if git check-ignore -q "$HOOK_REL_PATH" 2>/dev/null \
+           || git check-ignore -q "$SETTINGS_REL_PATH" 2>/dev/null; then
+            bootstrap_gitignored=true
+            log "WARN: .claude/ is gitignored in $repo_name — skills-bootstrap not delivered (change that repo's .gitignore, or drop it from repos.yml)."
+        else
+            if [[ "$hook_state" != "current" ]]; then
+                mkdir -p "$(dirname "$HOOK_REL_PATH")"
+                cp "$BOOTSTRAP_BLOB" "$HOOK_REL_PATH"
+                chmod 0755 "$HOOK_REL_PATH"
+                bootstrap_hook_written=true
+                if [[ "$hook_state" == "drifted" ]]; then
+                    log "skills-bootstrap: hook differed from the pin — overwritten with ${BOOTSTRAP_REF:0:7}."
+                else
+                    log "skills-bootstrap: hook added at ${BOOTSTRAP_REF:0:7}."
+                fi
+            fi
+
+            if [[ "$reg_state" != "registered" ]]; then
+                mkdir -p "$(dirname "$SETTINGS_REL_PATH")"
+                if register_result=$("$REGISTER_SCRIPT" "$SETTINGS_REL_PATH"); then
+                    [[ "$register_result" == "registered" || "$register_result" == "migrated" ]] && bootstrap_registered_now=true
+                    [[ "$register_result" == "migrated" ]] && matcher_migrated=true
+                    log "skills-bootstrap: settings.json — $register_result."
+                else
+                    log "WARN: could not register the hook in $SETTINGS_REL_PATH ($register_result) — leaving it untouched."
+                fi
+            fi
+        fi
+    fi
+
+    # ── owner-only guidance: retire ────────────────────────────────────
+    #
+    # The contributor file is classified above, and a repo that refuses it is
+    # skipped whole before anything is removed, so the stub never points at a
+    # file the repo lacks; the removals are committed together with it. The
+    # settings edit goes through unregister-hook.sh, which removes only the
+    # entries whose command equals the string this sync wrote and re-parses its
+    # own output before writing.
+
+    retired_files_now=()
+    retired_regs_now=false
+    if ! $retire_up_to_date; then
+        for retire_path in "${retire_files[@]}"; do
+            rm -f -- "$retire_path"
+            retired_files_now+=("$retire_path")
+            log "owner-guidance: removed $retire_path."
+        done
+        for retire_row in "${retire_regs[@]}"; do
+            if retire_result=$(BOOTSTRAP_HOOK_EVENT="${retire_row%%|*}" \
+                               BOOTSTRAP_HOOK_COMMAND="${retire_row#*|}" \
+                               "$UNREGISTER_SCRIPT" remove "$SETTINGS_REL_PATH"); then
+                [[ "$retire_result" == "removed" ]] && retired_regs_now=true
+                log "owner-guidance: settings.json ${retire_row%%|*} — $retire_result."
+            else
+                log "WARN: could not remove the ${retire_row%%|*} registration from $SETTINGS_REL_PATH (${retire_result:-no output}) — leaving it untouched."
+            fi
+        done
+    fi
+    retired_any=false
+    { (( ${#retired_files_now[@]} > 0 )) || $retired_regs_now; } && retired_any=true
+
+    # ── contributor rules: write ───────────────────────────────────────
+    contributor_written=false
+    if ! $contributor_up_to_date; then
+        mkdir -p "$(dirname "$CONTRIBUTOR_REL_PATH")"
+        cp "$CONTRIBUTOR_SOURCE" "$CONTRIBUTOR_REL_PATH"
+        contributor_written=true
+        log "contributor-rules: file ${contributor_state} — written ($(wc -c < "$CONTRIBUTOR_SOURCE" | tr -d ' ') bytes)."
+    fi
+
+    # ── .gitattributes: write ──────────────────────────────────────────
+    # Appended to, never rewritten (the helper's header has the byte rules).
+    gitattr_written=false
+    linguist_written=false
+    if ! $gitattr_up_to_date && [[ "$gitattr_state" != "present" ]]; then
+        if gitattr_result=$("$GITATTR_SCRIPT" ensure "$GITATTR_REL_PATH"); then
+            [[ "$gitattr_result" == "created" || "$gitattr_result" == "appended" ]] && gitattr_written=true
+            log "gitattributes: $GITATTR_REL_PATH — $gitattr_result."
+        else
+            log "WARN: could not add the hook-script LF line to $GITATTR_REL_PATH (${gitattr_result:-no output}) — leaving it untouched."
+        fi
+    fi
+    for linguist_line in ${linguist_missing[@]+"${linguist_missing[@]}"}; do
+        if linguist_result=$(HOOK_EOL_LINE="$linguist_line" HOOK_EOL_COMMENT="$LINGUIST_COMMENT" \
+                             "$GITATTR_SCRIPT" ensure "$GITATTR_REL_PATH"); then
+            [[ "$linguist_result" == "created" || "$linguist_result" == "appended" ]] && linguist_written=true
+            log "gitattributes: \`$linguist_line\` — $linguist_result."
+        else
+            log "WARN: could not add \`$linguist_line\` to $GITATTR_REL_PATH (${linguist_result:-no output}) — leaving it untouched."
+        fi
+    done
+    $linguist_written && gitattr_written=true
+
+    # ── Dependabot auto-merge workflow: write ──────────────────────────
+    # Managed: written when missing, overwritten when drifted.
+    automerge_written=false
+    automerge_lock_written=false
+    if ! $automerge_up_to_date; then
+        # The lockfile edit is built on a temp copy FIRST. Only when it
+        # succeeded are the workflow and the lockfile both put in place, so a
+        # failure leaves the tree with no lane change at all (no workflow
+        # without its lock entry) and nothing for the commit to stage.
+        automerge_lock_tmp=""
+        automerge_lock_result=""
+        automerge_lane_ok=true
+        if [[ "$automerge_lock_state" == "fix" ]]; then
+            automerge_lock_tmp=$(mktemp)
+            cp "$ACTIONS_LOCK_REL_PATH" "$automerge_lock_tmp"
+            if ! automerge_lock_result=$("$ACTIONS_LOCK_SCRIPT" apply "$automerge_lock_tmp" "$AUTOMERGE_WF_REL_PATH" 2>/dev/null); then
+                automerge_lane_ok=false
+                log "WARN: could not edit $ACTIONS_LOCK_REL_PATH in $repo_name — the Dependabot auto-merge lane writes nothing; run gh actions-lock there."
+            fi
+        fi
+        if $automerge_lane_ok; then
+            if [[ "$automerge_state" != "lockfile" ]]; then
+                mkdir -p "$(dirname "$AUTOMERGE_WF_REL_PATH")"
+                cp "$AUTOMERGE_TEMPLATE_DIR/dependabot-auto-merge.yml" "$AUTOMERGE_WF_REL_PATH"
+                automerge_written=true
+                log "dependabot auto-merge: workflow $([[ "$automerge_state" == "drifted" ]] && echo updated || echo added)."
+            fi
+            if [[ "$automerge_lock_result" == "updated" ]]; then
+                cat "$automerge_lock_tmp" > "$ACTIONS_LOCK_REL_PATH"
+                automerge_written=true
+                automerge_lock_written=true
+                log "dependabot auto-merge: $ACTIONS_LOCK_REL_PATH updated."
+            fi
+        fi
+        [[ -z "$automerge_lock_tmp" ]] || rm -f "$automerge_lock_tmp"
+    fi
+
+    # ── Dependabot config: write ───────────────────────────────────────
+    depcfg_written=false
+    if ! $depcfg_up_to_date; then
+        mkdir -p "$(dirname "$DEPCFG_REL_PATH")"
+        cp "$DEPCFG_TEMPLATE" "$DEPCFG_REL_PATH"
+        depcfg_written=true
+        log "dependabot config: $DEPCFG_REL_PATH $([[ "$depcfg_state" == "drifted" ]] && echo updated || echo added)."
+    fi
+
+    # ── privacy-comment-alert: write ───────────────────────────────────
+    pca_scan_written=false; pca_wf_written=false
+    if ! $pca_up_to_date; then
+        if [[ "$pca_scan_state" == "missing" || "$pca_scan_state" == "drifted" ]]; then
+            mkdir -p "$(dirname "$PCA_SCAN_REL_PATH")"
+            cp "$PCA_TEMPLATE_DIR/privacy-comment-scan.py" "$PCA_SCAN_REL_PATH"
+            pca_scan_written=true
+        fi
+        if [[ "$pca_wf_state" == "missing" ]]; then
+            mkdir -p "$(dirname "$PCA_WF_REL_PATH")"
+            cp "$PCA_TEMPLATE_DIR/privacy-comment-alert.yml" "$PCA_WF_REL_PATH"
+            pca_wf_written=true
+        fi
+    fi
+
+    # ── agent-checks: write ────────────────────────────────────────────
+    ac_runner_written=false; ac_dated_written=false; ac_wf_written=false; ac_eol_written=false
+    ac_guard_written=false; ac_registered_now=false; ac_trigger_written=false; ac_secret_written=false
+    if ! $ac_up_to_date; then
+        if [[ "$ac_runner_state" == "missing" || "$ac_runner_state" == "drifted" ]]; then
+            mkdir -p "$(dirname "$AC_RUNNER_REL_PATH")"
+            cp "$AGENT_CHECKS_TEMPLATE_DIR/agent-checks" "$AC_RUNNER_REL_PATH"
+            chmod 0755 "$AC_RUNNER_REL_PATH"
+            ac_runner_written=true
+        fi
+        if [[ "$ac_dated_state" == "missing" || "$ac_dated_state" == "drifted" ]]; then
+            for ac_dated_file in "${AC_DATED_FILES[@]}"; do
+                mkdir -p "$(dirname ".githooks/$ac_dated_file")"
+                cp "$AGENT_CHECKS_TEMPLATE_DIR/$ac_dated_file" ".githooks/$ac_dated_file"
+            done
+            ac_dated_written=true
+        fi
+        if [[ "$ac_wf_state" == "missing" ]]; then
+            mkdir -p "$(dirname "$AC_WF_REL_PATH")"
+            cp "$AGENT_CHECKS_TEMPLATE_DIR/agent-checks.yml" "$AC_WF_REL_PATH"
+            ac_wf_written=true
+        fi
+        if [[ "$ac_trigger_state" == "missing-edited" ]]; then
+            ac_trigger_result=$(ac_trigger_patch "$AC_WF_REL_PATH")
+            if [[ "$ac_trigger_result" == patched ]]; then
+                ac_trigger_written=true
+            else
+                log "WARN: $repo_name's $AC_WF_REL_PATH was not patched (${ac_trigger_result#skipped: }) — add edited to its pull_request types by hand."
+            fi
+        fi
+        if [[ "$ac_secret_state" == "missing-secret" ]]; then
+            ac_secret_result=$(ac_secret_patch "$AC_WF_REL_PATH")
+            if [[ "$ac_secret_result" == patched ]]; then
+                ac_secret_written=true
+            else
+                log "WARN: $repo_name's $AC_WF_REL_PATH was not patched (${ac_secret_result#skipped: }) — add $AC_SECRET_LINE to the env of the step that runs the runner by hand."
+            fi
+        fi
+        if [[ "$ac_eol_state" == "missing" ]]; then
+            if ac_eol_result=$(HOOK_EOL_LINE="$AC_EOL_LINE" HOOK_EOL_COMMENT="$AC_EOL_COMMENT" \
+                               "$GITATTR_SCRIPT" ensure "$GITATTR_REL_PATH"); then
+                [[ "$ac_eol_result" == "created" || "$ac_eol_result" == "appended" ]] && ac_eol_written=true
+            else
+                log "WARN: could not add the agent-checks LF line to $GITATTR_REL_PATH (${ac_eol_result:-no output}) — leaving it untouched."
+            fi
+        fi
+        if $ac_guard_deliver; then
+            if [[ "$ac_guard_state" != "current" ]]; then
+                mkdir -p "$(dirname "$AC_GUARD_REL_PATH")"
+                cp "$AGENT_CHECKS_TEMPLATE_DIR/agent-checks-guard.sh" "$AC_GUARD_REL_PATH"
+                chmod 0755 "$AC_GUARD_REL_PATH"
+                ac_guard_written=true
+            fi
+            if [[ "$ac_reg_state" != "registered" ]]; then
+                mkdir -p "$(dirname "$SETTINGS_REL_PATH")"
+                if ac_register_result=$(
+                        BOOTSTRAP_HOOK_EVENT="PreToolUse" \
+                        BOOTSTRAP_HOOK_MATCHER="$AC_GUARD_MATCHER" \
+                        BOOTSTRAP_HOOK_COMMAND='bash "$CLAUDE_PROJECT_DIR/.claude/hooks/agent-checks-guard.sh"' \
+                        BOOTSTRAP_HOOK_BASENAME="agent-checks-guard.sh" \
+                        BOOTSTRAP_HOOK_TIMEOUT="10" \
+                        "$REGISTER_SCRIPT" "$SETTINGS_REL_PATH"); then
+                    [[ "$ac_register_result" == "registered" || "$ac_register_result" == "migrated" ]] && ac_registered_now=true
+                    log "agent-checks: settings.json — $ac_register_result."
+                else
+                    log "WARN: could not register the agent-checks guard in $SETTINGS_REL_PATH ($ac_register_result) — leaving it untouched."
+                fi
+            fi
+        fi
+        log "agent-checks: runner=$ac_runner_written dated=$ac_dated_written workflow=$ac_wf_written trigger=$ac_trigger_written secret=$ac_secret_written eol=$ac_eol_written guard=$ac_guard_written registered=$ac_registered_now"
+    fi
+    # ── skill shell execution: write ───────────────────────────────────
+    skillshell_written=false
+    if ! $skillshell_up_to_date; then
+        mkdir -p "$(dirname "$SETTINGS_REL_PATH")"
+        if skillshell_result=$("$SKILL_SHELL_SCRIPT" ensure "$SETTINGS_REL_PATH"); then
+            [[ "$skillshell_result" == "set" ]] && skillshell_written=true
+            log "skill-shell: settings.json — $skillshell_result."
+        else
+            log "WARN: could not set disableSkillShellExecution in $SETTINGS_REL_PATH (${skillshell_result:-no output}) — leaving it untouched."
+        fi
+    fi
+
+    ac_any_written=false
+    if $pca_scan_written || $pca_wf_written; then ac_any_written=true; fi
+    if $ac_runner_written || $ac_dated_written || $ac_wf_written || $ac_trigger_written || $ac_secret_written || $ac_eol_written || $ac_guard_written || $ac_registered_now; then
+        ac_any_written=true
+    fi
+
+    add_paths=(AGENTS.md)
+    $ac_runner_written && add_paths+=("$AC_RUNNER_REL_PATH")
+    if $ac_dated_written; then
+        for ac_dated_file in "${AC_DATED_FILES[@]}"; do add_paths+=(".githooks/$ac_dated_file"); done
+    fi
+    $ac_wf_written && add_paths+=("$AC_WF_REL_PATH")
+    $ac_trigger_written && add_paths+=("$AC_WF_REL_PATH")
+    $ac_secret_written && add_paths+=("$AC_WF_REL_PATH")
+    $ac_guard_written && add_paths+=("$AC_GUARD_REL_PATH")
+    $pca_scan_written && add_paths+=("$PCA_SCAN_REL_PATH")
+    $pca_wf_written && add_paths+=("$PCA_WF_REL_PATH")
+    # git add takes a path twice without complaint, so the files the other
+    # lanes may also have touched need no once-only bookkeeping here.
+    $ac_eol_written && add_paths+=("$GITATTR_REL_PATH")
+    $ac_registered_now && add_paths+=("$SETTINGS_REL_PATH")
+    $skillshell_written && add_paths+=("$SETTINGS_REL_PATH")
+    $automerge_written && [[ "$automerge_state" != "lockfile" ]] && add_paths+=("$AUTOMERGE_WF_REL_PATH")
+    $automerge_lock_written && add_paths+=("$ACTIONS_LOCK_REL_PATH")
+    $depcfg_written && add_paths+=("$DEPCFG_REL_PATH")
+    $gitattr_written && add_paths+=("$GITATTR_REL_PATH")
+    { $claude_md_added || $claude_md_fixed; } && add_paths+=(CLAUDE.md)
+    $bootstrap_hook_written && add_paths+=("$HOOK_REL_PATH")
+    $bootstrap_registered_now && add_paths+=("$SETTINGS_REL_PATH")
+    (( ${#retired_files_now[@]} > 0 )) && add_paths+=("${retired_files_now[@]}")
+    $retired_regs_now && add_paths+=("$SETTINGS_REL_PATH")
+    $contributor_written && add_paths+=("$CONTRIBUTOR_REL_PATH")
+    git add "${add_paths[@]}"
+
+    # Whatever else changed, skills.lock is never among it. Cheap, absolute,
+    # and checked HERE rather than trusted: a staged lock means some future
+    # edit introduced a writer, and that must stop the repo, not ship. Uses
+    # --name-only (empty output == not staged) rather than --quiet, whose
+    # non-zero exit is indistinguishable from a git error.
+    if [[ -n "$(git diff --cached --name-only -- "$LOCK_REL_PATH")" ]]; then
+        fail "$repo_name: refusing to commit — $LOCK_REL_PATH is staged, and the sync must never write it."
+        ((FAIL_COUNT++)) || true
+        cd "$REPO_ROOT"; continue
+    fi
+
+    bootstrap_note=""
+    if $contributor_written; then
+        bootstrap_note="
+
+Also delivers the contributor rules ($CONTRIBUTOR_REL_PATH), the generated
+subset of the fleet guidance an outside contributor's agent reads on demand
+(ADR 0043)."
+    fi
+    if $bootstrap_hook_written || $bootstrap_registered_now; then
+        bootstrap_note="${bootstrap_note}
+
+Also delivers the skills-bootstrap SessionStart hook, fetched from
+${BOOTSTRAP_REGISTRY}@${BOOTSTRAP_REF:0:7} (pinned in _agent-guidance's
+repos.yml) and registered as an additional SessionStart entry. This repo's
+own skills.lock declares which bundles it installs and is not touched."
+    fi
+
+    if $skillshell_written; then
+        bootstrap_note="${bootstrap_note}
+
+Sets \"disableSkillShellExecution\": true in $SETTINGS_REL_PATH (one key; every
+other key preserved): Claude Code otherwise runs a !\`cmd\` line or a \`\`\`! block
+in a skill as a shell command before the model reads the skill, out of reach
+of review. See _agent-guidance's docs/decisions/0029."
+    fi
+
+    if $matcher_migrated; then
+        bootstrap_note="${bootstrap_note}
+
+Widens the fleet's SessionStart matcher from startup|resume to
+startup|resume|fork: since Claude Code 2.1.214 a forked session reports
+source \"fork\", so the old matcher skipped every fork. Only groups the
+sync wrote, holding nothing but its own hook, are changed."
+    fi
+
+    if $gitattr_written; then
+        bootstrap_note="${bootstrap_note}
+
+Updates .gitattributes (appended lines only; nothing else in the file
+changed): pins .claude/hooks/*.sh to LF, because a Windows autocrlf checkout
+gives them CRLF, which bash in WSL cannot parse (_agent-guidance's
+docs/decisions/0019), and marks .githooks/** and .claude/hooks/**
+linguist-vendored so GitHub's language bar shows this repo's own code
+(docs/decisions/0048)."
+    fi
+
+    if $automerge_written && [[ "$automerge_state" != "lockfile" ]]; then
+        bootstrap_note="${bootstrap_note}
+
+$([[ "$automerge_state" == "drifted" ]] && echo Updates || echo Adds) .github/workflows/dependabot-auto-merge.yml: its daily sweep
+merges each Dependabot PR once every check on the PR's head is green. The file
+is managed by _agent-guidance's templates/dependabot-auto-merge/ and is
+overwritten on the next sync if it drifts, so change the template, not this
+copy."
+    fi
+    if $automerge_lock_written; then
+        bootstrap_note="${bootstrap_note}
+
+Also edits $ACTIONS_LOCK_REL_PATH so \`gh actions-lock --no-fix\` stays green: the
+workflows map lists .github/workflows/dependabot-auto-merge.yml with no actions
+(the workflow has no uses: lines), and any dependency no workflow lists any
+more is removed. Nothing else in the lockfile changes."
+    fi
+
+    if $depcfg_written; then
+        bootstrap_note="${bootstrap_note}
+
+$([[ "$depcfg_state" == "drifted" ]] && echo Updates || echo Adds) .github/dependabot.yml: github-actions updates grouped (own actions
+skip the cooldown) and the synced dated-phrasing npm dependency held back. The
+file is managed by _agent-guidance's templates/dependabot/ and is overwritten
+on the next sync if it drifts, so change the template, not this copy. A repo
+that adds another ecosystem is no longer delivered it (ADR 0047)."
+    fi
+
+    if $retired_any; then
+        bootstrap_note="${bootstrap_note}
+
+Stops delivering the owner-only guidance (ADR 0043): removes
+${retired_files_now[*]:-no files} and, from $SETTINGS_REL_PATH, only the
+hook registrations this sync wrote for them (matched by command string; every
+other entry is preserved). The fleet owner's own setup installs that guidance
+into the owner's sessions; this repo's AGENTS.md stub and
+$CONTRIBUTOR_REL_PATH carry what any contributor needs."
+    fi
+
+    if $pca_scan_written || $pca_wf_written; then
+        bootstrap_note="${bootstrap_note}
+
+Delivers the privacy-comment-alert check ($PCA_WF_REL_PATH and
+$PCA_SCAN_REL_PATH): on an issue, comment or review event it scans the text for
+a denylisted term and, on a match, dispatches the fleet's self-alert email
+(naming only this repository and the scanning run). It never edits or deletes
+the text, and it is not a required check. Managed by _agent-guidance's
+templates/privacy-comment-alert/."
+    fi
+
+    if $ac_any_written; then
+        bootstrap_note="${bootstrap_note}
+
+Delivers the agent-checks git hook runner (.githooks/agent-checks) with its
+warn-only dated-phrasing pass (.githooks/dated-phrasing*), the CI check that
+runs it over every change, and a Claude Code PreToolUse guard against
+--no-verify. Owner machines run the runner from config-based git hooks; CI is
+the enforcement. Managed by _agent-guidance's templates/agent-checks/; see its
+docs/decisions/0021."
+        if $ac_trigger_written; then
+            bootstrap_note="${bootstrap_note}
+
+Adds edited to the pull_request types of $AC_WF_REL_PATH, so editing a pull
+request's description re-runs the check: its pr-tldr rule requires every
+description to begin with a TLDR. The sync otherwise never edits that
+workflow; see the 2026-11-02 addendum to docs/decisions/0021."
+        fi
+        if $ac_secret_written; then
+            bootstrap_note="${bootstrap_note}
+
+Adds the PRIVACY_DENYLIST secret to the env of the step in $AC_WF_REL_PATH
+that runs the runner, so its CI privacy scan can read the denylist. A run
+with no secret only warns and skips the scan; the sync otherwise never edits
+that workflow."
+        fi
+    fi
+
+    if $agents_up_to_date && $claude_md_present && ! $claude_md_fixed \
+       && $contributor_written && ! $skillshell_written && ! $ac_any_written && ! $automerge_written && ! $depcfg_written && ! $gitattr_written && ! $retired_any \
+       && ! $bootstrap_hook_written && ! $bootstrap_registered_now; then
+        commit_message="chore: deliver the fleet contributor rules
+
+AGENTS.md, the CLAUDE.md bridge and the hooks were already up to date.${bootstrap_note}"
+    elif $agents_up_to_date && $claude_md_present && ! $claude_md_fixed \
+       && $skillshell_written && ! $ac_any_written && ! $automerge_written && ! $depcfg_written && ! $gitattr_written && ! $retired_any \
+       && ! $bootstrap_hook_written && ! $bootstrap_registered_now; then
+        commit_message="chore: disable shell execution when a skill loads
+
+AGENTS.md, the CLAUDE.md bridge and the hooks were already up to date.${bootstrap_note}"
+    elif $agents_up_to_date && $claude_md_present && ! $claude_md_fixed \
+       && $ac_any_written && ! $automerge_written && ! $depcfg_written && ! $gitattr_written && ! $retired_any \
+       && ! $bootstrap_hook_written && ! $bootstrap_registered_now; then
+        commit_message="chore: deliver the agent-checks git hooks and CI check
+
+AGENTS.md, the CLAUDE.md bridge and the other hooks were already up to date.${bootstrap_note}"
+    elif $agents_up_to_date && $claude_md_present && ! $claude_md_fixed \
+       && $automerge_written && ! $gitattr_written && ! $bootstrap_hook_written && ! $bootstrap_registered_now && ! $retired_any; then
+        if [[ "$automerge_state" == "lockfile" ]]; then
+            automerge_title="chore: make actions.lock list the Dependabot auto-merge workflow"
+        else
+            automerge_title="chore: $([[ "$automerge_state" == "drifted" ]] && echo update || echo add) the Dependabot auto-merge workflow"
+            $automerge_lock_written && automerge_title="$automerge_title and its actions.lock entry"
+        fi
+        commit_message="$automerge_title
+
+AGENTS.md, the CLAUDE.md bridge and the hooks were already up to date.${bootstrap_note}"
+    elif $agents_up_to_date && $claude_md_present && ! $claude_md_fixed \
+       && $depcfg_written && ! $gitattr_written && ! $bootstrap_hook_written && ! $bootstrap_registered_now && ! $retired_any; then
+        commit_message="chore: $([[ "$depcfg_state" == "drifted" ]] && echo update || echo add) the managed Dependabot config
+
+AGENTS.md, the CLAUDE.md bridge and the hooks were already up to date.${bootstrap_note}"
+    elif $agents_up_to_date && $claude_md_present && ! $claude_md_fixed \
+       && $gitattr_written && ! $bootstrap_hook_written && ! $bootstrap_registered_now && ! $retired_any; then
+        commit_message="chore: update the managed .gitattributes lines
+
+AGENTS.md, the CLAUDE.md bridge and the hooks were already up to date.${bootstrap_note}"
+    elif $agents_up_to_date && $claude_md_present && ! $claude_md_fixed \
+       && $retired_any && ! $bootstrap_hook_written && ! $bootstrap_registered_now; then
+        commit_message="chore: stop delivering the owner-only guidance files
+
+AGENTS.md and the CLAUDE.md bridge were already up to date.${bootstrap_note}"
+    elif $agents_up_to_date && $claude_md_present && ! $claude_md_fixed; then
+        commit_message="chore: deliver the skills-bootstrap SessionStart hook
+
+AGENTS.md and the CLAUDE.md bridge were already up to date.${bootstrap_note}"
+    elif $agents_up_to_date && $claude_md_fixed; then
+        commit_message="chore: rewrite CLAUDE.md to the @AGENTS.md bridge
+
+AGENTS.md was already up to date, but CLAUDE.md did not import it, so
+Claude Code never saw the managed guidance. Rewritten to the standard
+@AGENTS.md bridge per this repo's fix_claude_md: true opt-in.${bootstrap_note}"
+    elif $agents_up_to_date; then
+        commit_message="chore: add CLAUDE.md bridge for AGENTS.md sync
+
+AGENTS.md was already up to date. Adds a CLAUDE.md importing
+@AGENTS.md for older CLIs and the retained fleet bridge policy.${bootstrap_note}"
+    else
+        commit_message="chore: sync AGENTS.md from _agent-guidance
+
+Sections: ${sections[*]:-none}
+Managed content updated by the central _agent-guidance repository.${bootstrap_note}"
+    fi
+
+    # "git commit failed" and "there was nothing to commit" are separate
+    # answers and are asked separately. Control only reaches here when the diff
+    # check above found something to change, so in practice every trip through
+    # the second branch is a real error — and the fleet's own tooling makes one
+    # error the common one: example-site-platform's dev-hooks-sync installs a global
+    # core.hooksPath whose secrets-scan pre-commit guard FAILS CLOSED when
+    # gitleaks is absent from PATH. That is correct for a security gate and
+    # fatal here, because it refuses EVERY per-repo commit. Folded into
+    # "Nothing to commit." and counted as a benign skip, that printed
+    # "=== Sync complete: 0 synced, 20 skipped, 0 failed ===" and exited 0
+    # having pushed nothing anywhere — a whole fleet silently unsynced by a
+    # green run. A refused commit is a per-repo FAILURE that names the reason.
+    if git diff --cached --quiet; then
+        log "Nothing to commit."
+        ((SKIP_COUNT++)) || true
+        cd "$REPO_ROOT"; continue
+    fi
+
+    if ! commit_out=$(git commit -m "$commit_message" 2>&1); then
+        fail "$repo_name: commit refused — $(head -1 <<< "$commit_out")"
+        ((FAIL_COUNT++)) || true
+        cd "$REPO_ROOT"; continue
+    fi
+
+    # ── Deliver: push directly, fall back to a PR ──────────────────────
+    # The sync App has a ruleset bypass on fleet-managed repos (declared in
+    # repo-settings; see its ADR 0001), so push straight to the default
+    # branch. Repos whose branch protection still rejects the push (the
+    # example-site-platform-managed repos) fall back to a PR with auto-merge.
+
+    # What the commit wrote, for the delivery line below (names only; paths
+    # in a repo's own tree, nothing from file contents).
+    committed_files=$(git diff-tree --no-commit-id --name-only -r HEAD | paste -sd, - | sed 's/,/, /g')
+
+    if git push origin HEAD:"$default_branch"; then
+        log "Pushed directly to $default_branch (App ruleset bypass); the commit wrote: $committed_files."
+
+        # Stale-PR/branch cleanup from the pre-direct-push era: an earlier
+        # run of this sync (branch + PR model) may have left an open PR and
+        # its head branch behind. Neither cleanup step is a repo failure.
+        existing_pr=$(gh pr list --head "$BRANCH_NAME" --json number \
+            --jq '.[0].number // empty' 2>/dev/null || true)
+        if [[ -n "$existing_pr" ]]; then
+            if ! gh pr close "$existing_pr" --comment "Superseded: the sync now pushes the managed AGENTS.md directly to the default branch (ruleset bypass declared in repo-settings fleet.yml; see its ADR 0001)."; then
+                log "WARN: could not close superseded PR #$existing_pr."
+            fi
+        fi
+        if git ls-remote --exit-code --heads origin "$BRANCH_NAME" >/dev/null 2>&1; then
+            if ! git push origin --delete "$BRANCH_NAME"; then
+                log "WARN: could not delete stale branch $BRANCH_NAME."
+            fi
+        fi
+
+        ((OK_COUNT++)) || true
+    else
+        log "WARN: direct push to $default_branch rejected — falling back to PR (the commit writes: $committed_files)."
+
+        git checkout -b "$BRANCH_NAME" 2>/dev/null || git checkout "$BRANCH_NAME" 2>/dev/null || {
+            fail "could not create branch in $repo_name"
+            ((FAIL_COUNT++)) || true
+            cd "$REPO_ROOT"; continue
+        }
+
+        # ── Force only over commits this sync itself wrote ─────────────
+        # The force-push keeps the one case it exists for: a stale
+        # agents-md-sync/update from the old PR-era, built on a
+        # since-superseded default branch, has diverged from this run's HEAD,
+        # so a plain push is rejected (fetch first) and without force the repo
+        # would never receive another update. What is NOT true is the
+        # justification this comment used to carry — "the branch is bot-owned,
+        # this sync is its only writer". On the example-site-platform-managed repos this
+        # fallback opens a PR and arms auto-merge, so a maintainer can push a
+        # conflict resolution or a reviewer-requested fix onto that branch; the
+        # next run then overwrote it and logged only "PR #N already exists —
+        # branch updated". agentskills' AGENTS.md still asserts the invariant
+        # this restores: the sync must not discard reviewer commits on an open
+        # PR.
+        #
+        # So the invariant is now the narrower, true one. Every commit the
+        # remote branch carries that the default branch does not already
+        # contain must have been written under $SYNC_BOT_EMAIL; one foreign
+        # committer and this repo is refused and NAMED, so the run goes red
+        # rather than silently overwriting a human's work. "Could not ask" is
+        # never read as "nothing is there": an existing branch whose commits
+        # cannot be listed refuses too.
+        branch_foreign_commits=""
+        ls_remote_status=0
+        git ls-remote --exit-code --heads origin "$BRANCH_NAME" >/dev/null 2>&1 \
+            || ls_remote_status=$?
+        if [[ $ls_remote_status -eq 0 ]]; then
+            # The range below needs a real merge base, which a --depth 1 clone
+            # cannot supply, so the clone is DEEPENED before it is asked.
+            #
+            # The graft is the trap, and the reading that looks reassuring gets
+            # it backwards: in the shallow clone `origin/$default_branch` has NO
+            # PARENTS, and that truncates the side of the range that is
+            # EXCLUDED, not the side that is included. The exclusion therefore
+            # collapses to one commit and `origin/<default>..FETCH_HEAD`
+            # degenerates into "the branch's whole history". Any stale
+            # agents-md-sync/update whose base is an ANCESTOR of — rather than
+            # equal to — the current default tip then yields the repo's OWN
+            # mainline commits, whose committers are humans; the guard below
+            # reads them as foreign, refuses, and counts the repo FAILED, so it
+            # never receives another update. That is exactly the case the
+            # force-push exists for, which the paragraph above says in as many
+            # words. Measured on git 2.43, one repo and two branches: forked
+            # from the current tip the range is 1 commit and is allowed; forked
+            # from `main~2` it is the bot's commit plus `human commit 1` and is
+            # refused on human@example.com. Nothing else differs between the two
+            # runs.
+            #
+            # The suite reproduces it, and only recently: for as long as the
+            # git mock cloned by LOCAL PATH, git took its hardlink optimisation
+            # and ignored `--depth` silently, so every fixture handed these
+            # scripts full history and no test in the suite had ever exercised a
+            # shallow clone — this guard shipped green while refusing the one
+            # case it exists for. The mock now clones over `file://`, which
+            # forces upload-pack and honours `--depth`, and
+            # ancorg/repo-stale-ancestor is the fixture built to be read through
+            # the graft: its branch forks from an ANCESTOR of main, so
+            # `origin/main..FETCH_HEAD` is [bot "stale sync", human "H0 init"]
+            # shallow and [bot "stale sync"] deepened. Delete the deepening and
+            # that fixture goes red on the human committer.
+            #
+            # `--unshallow` is fatal on a repository that is already complete
+            # ("--unshallow on a complete repository does not make sense", exit
+            # 128), so it is asked for only when the clone really is shallow —
+            # and whether it is, is read rather than assumed. A clone that
+            # cannot answer either question has not established the range, and
+            # an unestablished range REFUSES: never a force-push over commits
+            # nobody looked at, and never a refusal blamed on a committer this
+            # run never actually read.
+            deepen_ok=true
+            if ! clone_is_shallow=$(git rev-parse --is-shallow-repository 2>/dev/null); then
+                deepen_ok=false
+            elif [[ "$clone_is_shallow" == "true" ]] \
+                 && ! git fetch --unshallow origin >/dev/null 2>&1; then
+                deepen_ok=false
+            fi
+            if ! $deepen_ok; then
+                fail "$repo_name: could not deepen the shallow clone, so the range that says whose commits $BRANCH_NAME carries could not be established — refusing to force-push."
+                ((FAIL_COUNT++)) || true
+                cd "$REPO_ROOT"; continue
+            fi
+
+            # No refspec is given, so this fetch writes FETCH_HEAD and cannot
+            # collide with the local branch of the same name that was just
+            # checked out.
+            if ! git fetch origin "$BRANCH_NAME" >/dev/null 2>&1 \
+               || ! branch_commit_emails=$(git log --format='%ce' \
+                    "origin/$default_branch..FETCH_HEAD" 2>/dev/null); then
+                fail "$repo_name: could not read $BRANCH_NAME to see whose commits it carries — refusing to force-push."
+                ((FAIL_COUNT++)) || true
+                cd "$REPO_ROOT"; continue
+            fi
+            branch_foreign_commits=$(grep -v -x -F "$SYNC_BOT_EMAIL" <<< "$branch_commit_emails" || true)
+        elif [[ $ls_remote_status -ne 2 ]]; then
+            # 2 is ls-remote's own "no matching ref" — the branch does not
+            # exist, so there is nothing on the remote to protect and the push
+            # below simply creates it. Any other status is a transport or auth
+            # failure, which is not an answer to the question that was asked.
+            fail "$repo_name: could not tell whether $BRANCH_NAME exists — refusing to force-push."
+            ((FAIL_COUNT++)) || true
+            cd "$REPO_ROOT"; continue
+        fi
+
+        if [[ -n "$branch_foreign_commits" ]]; then
+            fail "$repo_name: $BRANCH_NAME carries a commit this sync did not write (committer $(head -1 <<< "$branch_foreign_commits")) — refusing to force-push over it. Merge or close its PR, or delete the branch, then re-run."
+            ((FAIL_COUNT++)) || true
+            cd "$REPO_ROOT"; continue
+        fi
+
+        # The default branch itself stays gated by the repo's protection.
+        if ! git push -u --force origin "$BRANCH_NAME"; then
+            fail "push failed for $repo_name"
+            ((FAIL_COUNT++)) || true
+            cd "$REPO_ROOT"; continue
+        fi
+
+        # ── Open or update PR ──────────────────────────────────────────
+
+        # Surface CLAUDE.md bridge status in the PR body — the same
+        # observability gap that motivated the WARN log line above, but
+        # written where a reviewer approving the sync PR will actually see it.
+        pr_extra=""
+        if $warn_no_import; then
+            pr_extra="⚠️ **CLAUDE.md does not import \`@AGENTS.md\`** — Claude Code will not see this guidance. This sync never rewrites an existing CLAUDE.md by default. To fix, add a line containing exactly \`@AGENTS.md\` (outside code fences) to CLAUDE.md, or set \`fix_claude_md: true\` in \`.agents-sync.yml\` to let the sync propose the rewrite."
+        elif $claude_md_fixed; then
+            pr_extra="This PR also rewrites CLAUDE.md to the standard \`@AGENTS.md\` bridge (opted in via \`fix_claude_md: true\`) because the previous file never imported AGENTS.md."
+        fi
+
+        # The bootstrap hook gets its OWN paragraph, always, when it is part of
+        # the change. A reviewer approving this PR is approving a script that
+        # runs at session start and installs skills with no further prompt, and
+        # the always-on context those skills cost — that must not arrive as an
+        # unremarked file in a diff titled "sync AGENTS.md".
+        if $bootstrap_hook_written || $bootstrap_registered_now; then
+            pr_extra="${pr_extra}
+
+**This PR also delivers \`$HOOK_REL_PATH\`** — a \`SessionStart\` hook, fetched
+from [\`${BOOTSTRAP_REGISTRY}\`](https://github.com/${BOOTSTRAP_REGISTRY}/blob/${BOOTSTRAP_REF}/${BOOTSTRAP_PATH}) at
+the immutable commit \`${BOOTSTRAP_REF:0:7}\` pinned in \`repos.yml\`, with its
+sha256 verified before writing. On **ephemeral** surfaces only (cloud sessions,
+CI runners — it no-ops on a developer's machine) it installs the bundles this
+repo's own \`skills.lock\` names, verifying every skill's digest. Those skills
+then cost always-on context in each such session.
+
+It is registered as an **additional** \`hooks.SessionStart\` entry in
+\`$SETTINGS_REL_PATH\`; existing entries are preserved. \`$LOCK_REL_PATH\` is
+**not** modified by this sync — it is this repo's own declaration."
+        fi
+
+        if $gitattr_written; then
+            pr_extra="${pr_extra}
+
+This PR also appends managed lines to \`$GITATTR_REL_PATH\`, each with a comment
+above it; nothing else in that file changes. \`.claude/hooks/*.sh text eol=lf\`:
+a Windows \`core.autocrlf=true\` checkout gives the hook scripts CRLF, which
+bash in WSL cannot parse ([ADR 0019](https://github.com/dummy-gha/_agent-guidance/blob/main/docs/decisions/0019-sync-pins-hook-scripts-to-lf-via-gitattributes.md)).
+\`.githooks/** linguist-vendored\` and \`.claude/hooks/** linguist-vendored\`:
+the synced tooling stops counting as this repo's code in GitHub's language
+bar ([ADR 0048](https://github.com/dummy-gha/_agent-guidance/blob/main/docs/decisions/0048-sync-marks-synced-tooling-linguist-vendored.md))."
+        fi
+
+        if $retired_any; then
+            pr_extra="${pr_extra}
+
+This PR also stops delivering the owner-only guidance (ADR 0043): it removes
+\`${retired_files_now[*]:-no files}\` and, from \`$SETTINGS_REL_PATH\`, only the
+hook registrations this sync wrote for those files (matched by command string;
+every other entry is preserved). The fleet owner's own setup installs that
+guidance into the owner's sessions. What any contributor needs is in the
+\`AGENTS.md\` stub and \`$CONTRIBUTOR_REL_PATH\`."
+        fi
+
+        existing_pr=$(gh pr list --head "$BRANCH_NAME" --json number \
+            --jq '.[0].number // empty' 2>/dev/null || true)
+
+        if [[ -n "$existing_pr" ]]; then
+            log "Direct push rejected — updated existing PR #$existing_pr."
+            pr_number="$existing_pr"
+        else
+            # --head: gh cannot infer the head branch in a fresh temp clone.
+            # --base: the default branch varies across repos (main vs master),
+            #         and omitting --base while passing --head can mistarget.
+            # Capture the created PR's URL to derive its number for auto-merge.
+            if pr_url=$(gh pr create \
+                --head "$BRANCH_NAME" \
+                --base "$default_branch" \
+                --title "chore: sync AGENTS.md from _agent-guidance" \
+                --body "$(cat <<EOF
+Automated sync of the managed portion of \`AGENTS.md\` from the central
+[\`_agent-guidance\`](https://github.com/${ORG}/${SELF_REPO}) repository.
+
+**Sections included:** ${sections[*]:-none}
+
+Content below \`## Repo-specific additions\` has been preserved.
+
+This sync also ensures a \`CLAUDE.md\` exists that imports \`AGENTS.md\`
+via \`@AGENTS.md\`. Claude Code 2.1.277+ can read AGENTS.md when CLAUDE.md
+is absent; the fleet keeps the bridge for older CLIs pending the owner
+decision recorded in [The CLAUDE.md bridge](https://github.com/${ORG}/${SELF_REPO}#the-claudemd-bridge). An
+existing CLAUDE.md is left untouched unless this repo opts in via
+\`fix_claude_md: true\`.
+
+${pr_extra}
+EOF
+)"); then
+                log "Direct push rejected — opened PR $pr_url."
+                pr_number="${pr_url##*/}"
+            else
+                fail "PR creation failed for $repo_name"
+                ((FAIL_COUNT++)) || true
+                cd "$REPO_ROOT"; continue
+            fi
+        fi
+
+        # Ask for auto-merge, and accept whichever of its two outcomes this
+        # produces. gh only ARMS the merge where a repo requires at least one
+        # check; where nothing is required — most of this fleet —
+        # `gh pr merge --auto` instead merges the PR on the spot, before any
+        # check has run. That is acceptable HERE, and only here: this
+        # fallback PR stands in for the direct push the sync makes on every
+        # other repo, which no check gates either, so an immediate merge
+        # loses nothing a direct push would already have skipped. Do not
+        # copy this call into anything whose merge needs to wait on CI — see
+        # #141 and cms-platform#437 — the same mechanism merged bump pull
+        # requests (bump-consumer-locks.sh) and Dependabot pull requests (the
+        # fleet's dependabot-auto-merge.yml) before their checks had run.
+        # Merge commit FIRST, squash only as a fallback: the fleet default is
+        # merge-only (repo-settings' fleet.yml disables squash and rebase), and
+        # the three example-site-platform-managed repos that do keep squash allow plain
+        # merges too — so `--merge` is the one method that works on every repo
+        # this sync touches, and leading with squash spent a guaranteed failed
+        # call per repo. The fallback stays because a repo CAN be configured
+        # squash-only, and a PR left open for manual merge is an acceptable
+        # degraded outcome — none of these count as a repo failure.
+        if [[ -n "$pr_number" ]]; then
+            if ! gh pr merge "$pr_number" --auto --merge 2>/dev/null \
+                && ! gh pr merge "$pr_number" --auto --squash 2>/dev/null; then
+                log "WARN: could not enable auto-merge on PR #$pr_number — left open for manual merge."
+            fi
+        else
+            log "WARN: could not enable auto-merge — left open for manual merge."
+        fi
+
+        ((OK_COUNT++)) || true
+    fi
+
+    cd "$REPO_ROOT"
+done
+
+done
+
+echo ""
+echo "=== Sync complete: $OK_COUNT synced, $SKIP_COUNT skipped, $FAIL_COUNT failed ==="
+
+if [[ $FAIL_COUNT -gt 0 ]]; then
+    exit 1
+fi
