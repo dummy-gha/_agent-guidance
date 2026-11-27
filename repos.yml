@@ -110,27 +110,6 @@ skills_bootstrap:
     # Renamed from `agentskills-private` on 2026-09-24.
     # lock: committed — PR #8 merged 2026-08-19.
     - acsi-agentskills-private
-    # lock: committed — federated (acsi-agentskills + example-site-platform), with the hook
-    # and its registration already in place. Listed so the sync keeps the hook
-    # current against the pin above.
-    - example-site-a
-    # example-site-platform gitignores `.claude/` (with an explanatory comment), which
-    # is why ADR 0001 refused to list it. Its ONE companion PR carries BOTH
-    # remaining steps: the narrowed ignore and the repo's first skills.lock.
-    # (GHA-bench was the second such entry; it was archived in October 2026,
-    # so discovery no longer reaches it and it is no longer listed.) So the
-    # drift cell for it reads `no-lock` like the other pending entries, not
-    # `blocked`: drift-report.sh tests the lock BEFORE it probes the ignore, so
-    # `blocked` is only reachable once a lock exists. The entry is INERT, not
-    # wrong; what it buys is that nothing further is needed HERE once the
-    # companion merges.
-    # lock + ignore: committed — cms-platform#275 merged 2026-08-19.
-    - example-site-platform
-    # lock: committed — PR #134 merged 2026-08-16, so the lock this file used
-    # to call "in flight" has been committed for three days, and the sync
-    # delivered the hook on its next run (2026-08-18). The stale note said the
-    # drift report reads `no-lock`; it reads `ok`.
-    - example-site-b
     # lock: committed — PR #17 merged 2026-08-19.
     - repo-settings
     # lock: committed — PR #9 merged 2026-08-19.
@@ -281,9 +260,6 @@ cron_coverage:
     - _agent-guidance
     - acsi-agentskills
     - acsi-agentskills-private
-    - example-site-a
-    - example-site-platform
-    - example-site-b
     - repo-settings
     # skills-evals is not listed while you have no such repo: a name neither
     # owner has fails dependabot-config-health.yml every day. The adoption
